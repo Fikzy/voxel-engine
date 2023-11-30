@@ -1,5 +1,6 @@
 use bytemuck;
 use cgmath;
+use cgmath::num_traits::clamp;
 use std::mem;
 use std::time::Duration;
 use wgpu::{self, util::DeviceExt};
@@ -30,61 +31,28 @@ impl Vertex {
 }
 
 #[rustfmt::skip]
-const FRONT_FACE_VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.5,  0.5, 0.5] },
-    Vertex { position: [-0.5, -0.5, 0.5] },
-    Vertex { position: [ 0.5, -0.5, 0.5] },
-    Vertex { position: [ 0.5,  0.5, 0.5] },
-];
-#[rustfmt::skip]
-const BACK_FACE_VERTICES: &[Vertex] = &[
-    Vertex { position: [ 0.5,  0.5, -0.5] },
-    Vertex { position: [ 0.5, -0.5, -0.5] },
-    Vertex { position: [-0.5, -0.5, -0.5] },
-    Vertex { position: [-0.5,  0.5, -0.5] },
-];
-#[rustfmt::skip]
-const LEFT_FACE_VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.5,  0.5, -0.5] },
-    Vertex { position: [-0.5, -0.5, -0.5] },
-    Vertex { position: [-0.5, -0.5,  0.5] },
-    Vertex { position: [-0.5,  0.5,  0.5] },
-];
-#[rustfmt::skip]
-const RIGHT_FACE_VERTICES: &[Vertex] = &[
-    Vertex { position: [ 0.5,  0.5,  0.5] },
-    Vertex { position: [ 0.5, -0.5,  0.5] },
-    Vertex { position: [ 0.5, -0.5, -0.5] },
-    Vertex { position: [ 0.5,  0.5, -0.5] },
-];
-#[rustfmt::skip]
-const BOTTOM_FACE_VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.5, -0.5,  0.5] },
-    Vertex { position: [-0.5, -0.5, -0.5] },
-    Vertex { position: [ 0.5, -0.5, -0.5] },
-    Vertex { position: [ 0.5, -0.5,  0.5] },
-];
-#[rustfmt::skip]
-const TOP_FACE_VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.5,  0.5, -0.5] },
-    Vertex { position: [-0.5,  0.5,  0.5] },
-    Vertex { position: [ 0.5,  0.5,  0.5] },
-    Vertex { position: [ 0.5,  0.5, -0.5] },
+const WIRE_CUBE_VERTICES: &[Vertex] = &[
+    Vertex { position: [0.0, 0.0, 0.0] },
+    Vertex { position: [1.0, 0.0, 0.0] },
+    Vertex { position: [1.0, 1.0, 0.0] },
+    Vertex { position: [0.0, 1.0, 0.0] },
+    Vertex { position: [0.0, 0.0, 1.0] },
+    Vertex { position: [1.0, 0.0, 1.0] },
+    Vertex { position: [1.0, 1.0, 1.0] },
+    Vertex { position: [0.0, 1.0, 1.0] },
 ];
 
-const FACE_VERTICES: &[&[Vertex]] = &[
-    FRONT_FACE_VERTICES,
-    BACK_FACE_VERTICES,
-    LEFT_FACE_VERTICES,
-    RIGHT_FACE_VERTICES,
-    BOTTOM_FACE_VERTICES,
-    TOP_FACE_VERTICES,
+#[rustfmt::skip]
+const WIRE_CUBE_INDICES: &[u16] = &[
+    0, 1, 1, 2, 2, 3, 3, 0, // Front face
+    4, 5, 5, 6, 6, 7, 7, 4, // Back face
+    0, 4, 1, 5, 2, 6, 3, 7, // Side faces
 ];
 
-const FACE_INDICES: &[u16] = &[0, 1, 3, 1, 2, 3];
-
+#[derive(Copy, Clone)]
 struct Instance {
     position: cgmath::Vector3<f32>,
+    scale: f32,
 }
 
 #[repr(C)]
@@ -96,7 +64,9 @@ struct InstanceRaw {
 impl Instance {
     fn to_raw(&self) -> InstanceRaw {
         InstanceRaw {
-            model: cgmath::Matrix4::from_translation(self.position).into(),
+            model: (cgmath::Matrix4::from_translation(self.position)
+                * cgmath::Matrix4::from_scale(self.scale))
+            .into(),
         }
     }
 }
@@ -139,13 +109,22 @@ impl InstanceRaw {
     }
 }
 
-const CHUNK_SIZE: usize = 16;
+// 1 unit = 1 meter
+// 16^3 voxels per unit
+// 64^3 voxels per chunk
+const CHUNK_SIZE: usize = 4;
 
-const CHUNK_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(
-    CHUNK_SIZE as f32 * 0.5,
-    CHUNK_SIZE as f32 * 0.5,
-    CHUNK_SIZE as f32 * 0.5,
+// 16^3 chunks = 4096 chunks loaded around the player
+// Number of chunks to load in each direction from the player
+const CHUNK_LOAD_RADIUS: usize = 8;
+const CHUNK_LOAD_RADIUS_ISIZE: isize = CHUNK_LOAD_RADIUS as isize;
+const CHUNK_LOAD_RADIUS_VEC3_I32: cgmath::Vector3<i32> = cgmath::Vector3::new(
+    CHUNK_LOAD_RADIUS as i32,
+    CHUNK_LOAD_RADIUS as i32,
+    CHUNK_LOAD_RADIUS as i32,
 );
+const CHUNK_LOAD_DIAMETER: usize = CHUNK_LOAD_RADIUS * 2;
+const CHUNK_LOAD_DIAMETER_I32: i32 = CHUNK_LOAD_DIAMETER as i32;
 
 pub struct State {
     pub surface: wgpu::Surface,
@@ -161,17 +140,22 @@ pub struct State {
     pub camera_uniform: CameraUniform,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
-    face_vertex_buffers: [wgpu::Buffer; 6],
-    face_index_buffer: wgpu::Buffer,
+    // face_vertex_buffers: [wgpu::Buffer; 6],
+    // face_index_buffer: wgpu::Buffer,
+    wire_cube_vertex_buffer: wgpu::Buffer,
+    wire_cube_index_buffer: wgpu::Buffer,
     // chunk_data: [[[u8; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
-    face_instances: [Vec<InstanceRaw>; 6],
-    face_instance_buffers: [wgpu::Buffer; 6],
+    // face_instances: [Vec<InstanceRaw>; 6],
+    // face_instance_buffers: [wgpu::Buffer; 6],
+    wire_cube_instances: Vec<InstanceRaw>,
+    wire_cube_instance_buffer: wgpu::Buffer,
+    player_chunk: cgmath::Vector3<i32>,
+    pub mouse_pressed: bool,
+    pub mouse_grabbed: bool,
     // The window must be declared after the surface so
     // it gets dropped after it as the surface contains
     // unsafe references to the window's resources.
     pub window: Window,
-    pub mouse_pressed: bool,
-    pub mouse_grabbed: bool,
 }
 
 impl State {
@@ -233,7 +217,8 @@ impl State {
             width: size.width,
             height: size.height,
             // present_mode: surface_caps.present_modes[0],
-            present_mode: wgpu::PresentMode::Immediate, // Vsync off
+            present_mode: wgpu::PresentMode::AutoVsync,
+            // present_mode: wgpu::PresentMode::Immediate, // Vsync off
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -246,7 +231,7 @@ impl State {
 
         let depth_texture = Texture::create_depth_texture(&device, &config, "depth_texture");
 
-        let camera = Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
+        let camera = Camera::new((0.5, 0.5, 0.5), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
             Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
         let camera_controller = CameraController::new(10.0, 20.0, 0.2);
@@ -309,10 +294,12 @@ impl State {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
+                // topology: wgpu::PrimitiveTopology::TriangleList,
+                topology: wgpu::PrimitiveTopology::LineList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                // cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
                 // polygon_mode: wgpu::PolygonMode::Fill,
                 polygon_mode: wgpu::PolygonMode::Line,
                 unclipped_depth: false,
@@ -333,98 +320,63 @@ impl State {
             multiview: None,
         });
 
-        let face_vertex_buffers = FACE_VERTICES
-            .iter()
-            .map(|face_vertices| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Face Vertex Buffer"),
-                    contents: bytemuck::cast_slice(face_vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
+        let wire_cube_vertex_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Wire Cube Vertex Buffer"),
+                contents: bytemuck::cast_slice(WIRE_CUBE_VERTICES),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
 
-        let face_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(FACE_INDICES),
+        let wire_cube_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wire Cube Index Buffer"),
+            contents: bytemuck::cast_slice(WIRE_CUBE_INDICES),
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        const CHUNK_CENTER: cgmath::Vector3<f32> = cgmath::Vector3::new(
-            CHUNK_SIZE as f32 * 0.5,
-            CHUNK_SIZE as f32 * 0.5,
-            CHUNK_SIZE as f32 * 0.5,
-        );
-        const CHUNK_RADIUS_SQUARED: f32 = (CHUNK_SIZE / 2 * CHUNK_SIZE / 2) as f32;
+        let mut wire_cube_instances = vec![
+            InstanceRaw {
+                model: Default::default(),
+            };
+            CHUNK_LOAD_DIAMETER.pow(3)
+        ];
 
-        let mut chunk_data = [[[0; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE];
-        for x in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for z in 0..CHUNK_SIZE {
-                    // Sphere
-                    let dist_squared = (x as f32 - CHUNK_CENTER.x).powi(2)
-                        + (y as f32 - CHUNK_CENTER.y).powi(2)
-                        + (z as f32 - CHUNK_CENTER.z).powi(2);
-                    if dist_squared < CHUNK_RADIUS_SQUARED {
-                        chunk_data[x][y][z] = 1 as u8;
-                    }
-                }
-            }
-        }
-
-        let mut face_instances: [Vec<InstanceRaw>; 6] = Default::default();
-        for x in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for z in 0..CHUNK_SIZE {
-                    if chunk_data[x][y][z] == 0 {
-                        continue;
-                    }
+        // Load chunks at the origin
+        for x in 0..CHUNK_LOAD_DIAMETER {
+            for y in 0..CHUNK_LOAD_DIAMETER {
+                for z in 0..CHUNK_LOAD_DIAMETER {
+                    let chunk_coord = -CHUNK_LOAD_RADIUS_VEC3_I32
+                        + cgmath::Vector3::new(x as i32, y as i32, z as i32);
 
                     let instance = Instance {
                         position: cgmath::Vector3 {
-                            x: x as f32,
-                            y: y as f32,
-                            z: z as f32,
-                        } - CHUNK_DISPLACEMENT,
+                            x: ((x as isize - CHUNK_LOAD_RADIUS_ISIZE) * CHUNK_SIZE as isize)
+                                as f32,
+                            y: ((y as isize - CHUNK_LOAD_RADIUS_ISIZE) * CHUNK_SIZE as isize)
+                                as f32,
+                            z: ((z as isize - CHUNK_LOAD_RADIUS_ISIZE) * CHUNK_SIZE as isize)
+                                as f32,
+                        },
+                        scale: CHUNK_SIZE as f32,
                     }
                     .to_raw();
 
-                    if z == CHUNK_SIZE - 1 || chunk_data[x][y][z + 1] == 0 {
-                        face_instances[0].push(instance);
-                    }
-                    if z == 0 || chunk_data[x][y][z - 1] == 0 {
-                        face_instances[1].push(instance);
-                    }
-                    if x == 0 || chunk_data[x - 1][y][z] == 0 {
-                        face_instances[2].push(instance);
-                    }
-                    if x == CHUNK_SIZE - 1 || chunk_data[x + 1][y][z] == 0 {
-                        face_instances[3].push(instance);
-                    }
-                    if y == 0 || chunk_data[x][y - 1][z] == 0 {
-                        face_instances[4].push(instance);
-                    }
-                    if y == CHUNK_SIZE - 1 || chunk_data[x][y + 1][z] == 0 {
-                        face_instances[5].push(instance);
-                    }
+                    #[rustfmt::skip]
+                    let idx =
+                        chunk_coord.x.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32).pow(2) +
+                        chunk_coord.y.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32) +
+                        chunk_coord.z.rem_euclid(CHUNK_LOAD_DIAMETER_I32);
+
+                    wire_cube_instances[idx as usize] = instance;
                 }
             }
         }
 
-        let face_instance_buffers: [wgpu::Buffer; 6] = face_instances
-            .iter()
-            .map(|face_instances| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Face Instance Buffer"),
-                    contents: bytemuck::cast_slice(face_instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
+        let wire_cube_instance_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Wire Cube Instance Buffer"),
+                contents: bytemuck::cast_slice(&wire_cube_instances),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
 
         Self {
             window,
@@ -441,11 +393,11 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
-            face_vertex_buffers,
-            face_index_buffer,
-            // chunk_data,
-            face_instances,
-            face_instance_buffers,
+            wire_cube_vertex_buffer,
+            wire_cube_index_buffer,
+            wire_cube_instances,
+            wire_cube_instance_buffer,
+            player_chunk: cgmath::Vector3::new(0, 0, 0),
             mouse_pressed: false,
             mouse_grabbed: false,
         }
@@ -520,6 +472,115 @@ impl State {
         self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform
             .update_view_proj(&self.camera, &self.projection);
+
+        let current_player_chunk = cgmath::Vector3::new(
+            (self.camera.position.x / CHUNK_SIZE as f32).floor() as i32,
+            (self.camera.position.y / CHUNK_SIZE as f32).floor() as i32,
+            (self.camera.position.z / CHUNK_SIZE as f32).floor() as i32,
+        );
+        if current_player_chunk != self.player_chunk {
+            println!("Player moved to chunk: {:?}", current_player_chunk);
+
+            let mut displacement = current_player_chunk - self.player_chunk;
+            displacement.x = clamp(
+                displacement.x,
+                -CHUNK_LOAD_DIAMETER_I32,
+                CHUNK_LOAD_DIAMETER_I32,
+            );
+            displacement.y = clamp(
+                displacement.y,
+                -CHUNK_LOAD_DIAMETER_I32,
+                CHUNK_LOAD_DIAMETER_I32,
+            );
+            displacement.z = clamp(
+                displacement.z,
+                -CHUNK_LOAD_DIAMETER_I32,
+                CHUNK_LOAD_DIAMETER_I32,
+            );
+            // println!("Displacement: {:?}", displacement);
+
+            #[rustfmt::skip]
+            let valid_start = self.player_chunk - CHUNK_LOAD_RADIUS_VEC3_I32 + cgmath::Vector3::new(
+                if displacement.x < 0 { 0 } else { displacement.x },
+                if displacement.y < 0 { 0 } else { displacement.y },
+                if displacement.z < 0 { 0 } else { displacement.z },
+            );
+
+            #[rustfmt::skip]
+            let valid_end = self.player_chunk + CHUNK_LOAD_RADIUS_VEC3_I32 + cgmath::Vector3::new(
+                if displacement.x < 0 { displacement.x } else { 0 },
+                if displacement.y < 0 { displacement.y } else { 0 },
+                if displacement.z < 0 { displacement.z } else { 0 },
+            );
+
+            // println!("Valid start: {:?}, end: {:?}", valid_start, valid_end);
+
+            let mut loaded_chunks_count = 0;
+
+            // FIXME: iterate only over the chunks that need to be loaded?
+            for x in 0..CHUNK_LOAD_DIAMETER {
+                for y in 0..CHUNK_LOAD_DIAMETER {
+                    for z in 0..CHUNK_LOAD_DIAMETER {
+                        let chunk_coord = current_player_chunk - CHUNK_LOAD_RADIUS_VEC3_I32
+                            + cgmath::Vector3::new(x as i32, y as i32, z as i32);
+
+                        if chunk_coord.x >= valid_start.x
+                            && chunk_coord.x < valid_end.x
+                            && chunk_coord.y >= valid_start.y
+                            && chunk_coord.y < valid_end.y
+                            && chunk_coord.z >= valid_start.z
+                            && chunk_coord.z < valid_end.z
+                        {
+                            continue;
+                        }
+
+                        // TODO: Unload old chunk
+
+                        // TODO: Load new chunk
+
+                        let instance = Instance {
+                            position: cgmath::Vector3 {
+                                x: ((current_player_chunk.x as isize - CHUNK_LOAD_RADIUS_ISIZE
+                                    + x as isize)
+                                    * CHUNK_SIZE as isize)
+                                    as f32,
+                                y: ((current_player_chunk.y as isize - CHUNK_LOAD_RADIUS_ISIZE
+                                    + y as isize)
+                                    * CHUNK_SIZE as isize)
+                                    as f32,
+                                z: ((current_player_chunk.z as isize - CHUNK_LOAD_RADIUS_ISIZE
+                                    + z as isize)
+                                    * CHUNK_SIZE as isize)
+                                    as f32,
+                            },
+                            scale: CHUNK_SIZE as f32,
+                        }
+                        .to_raw();
+
+                        #[rustfmt::skip]
+                        let idx =
+                            chunk_coord.x.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32).pow(2) +
+                            chunk_coord.y.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32) +
+                            chunk_coord.z.rem_euclid(CHUNK_LOAD_DIAMETER_I32);
+
+                        self.wire_cube_instances[idx as usize] = instance;
+
+                        loaded_chunks_count += 1;
+                    }
+                }
+            }
+
+            self.player_chunk = current_player_chunk;
+
+            println!("Loaded {} chunks", loaded_chunks_count);
+
+            self.queue.write_buffer(
+                &self.wire_cube_instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.wire_cube_instances),
+            );
+        }
+
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -572,18 +633,18 @@ impl State {
 
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            for i in 0..6 {
-                render_pass.set_vertex_buffer(0, self.face_vertex_buffers[i].slice(..));
-                render_pass.set_vertex_buffer(1, self.face_instance_buffers[i].slice(..));
-                render_pass
-                    .set_index_buffer(self.face_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_vertex_buffer(0, self.wire_cube_vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.wire_cube_instance_buffer.slice(..));
+            render_pass.set_index_buffer(
+                self.wire_cube_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
 
-                render_pass.draw_indexed(
-                    0..FACE_INDICES.len() as _,
-                    0,
-                    0..self.face_instances[i].len() as _,
-                );
-            }
+            render_pass.draw_indexed(
+                0..WIRE_CUBE_INDICES.len() as _,
+                0,
+                0..self.wire_cube_instances.len() as _,
+            );
         }
 
         self.queue.submit([encoder.finish()]);

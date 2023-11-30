@@ -16,7 +16,7 @@ use winit::{
 use crate::state::State;
 
 const DT_QUEUE_SIZE: usize = 30;
-const FPS_PRINT_INTERVAL: Duration = Duration::from_secs(1);
+const FPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn run() {
     let event_loop = EventLoop::new().unwrap();
@@ -64,13 +64,14 @@ pub async fn run() {
                         last_render_time = now;
 
                         dt_queue.push(dt.as_micros());
-                        if last_fps_print.elapsed() > FPS_PRINT_INTERVAL {
+                        if last_fps_print.elapsed() > FPS_REFRESH_INTERVAL {
                             last_fps_print = Instant::now();
-                            println!(
-                                "FPS: {}",
-                                1_000_000.0
-                                    / (dt_queue.iter().sum::<u128>() as f64 / DT_QUEUE_SIZE as f64)
-                            );
+                            let fps = 1_000_000.0
+                                / (dt_queue.iter().sum::<u128>() as f64 / DT_QUEUE_SIZE as f64);
+                            state
+                                .window
+                                .set_title(&format!("Voxel Engine - {:.1} fps", fps));
+                            // println!("{:.1} fps", fps);
                         }
 
                         state.update(dt);
