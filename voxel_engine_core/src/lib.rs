@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod camera_controller;
 pub mod state;
+pub mod storage_texture;
 pub mod texture;
 
 use circular_queue::CircularQueue;
