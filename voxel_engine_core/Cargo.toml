@@ -12,5 +12,6 @@ circular-queue = { workspace = true }
 cgmath = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+noise = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true, features = [ "rwh_05" ] }

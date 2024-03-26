@@ -1,7 +1,9 @@
 // Vertex shader
 
 struct CameraUniform {
-    view_position: vec4<f32>,
+    position: vec4<f32>,
+    projection: mat4x4<f32>,
+    camera_to_world: mat4x4<f32>,
     view_proj: mat4x4<f32>,
 };
 

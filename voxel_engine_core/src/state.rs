@@ -1,6 +1,7 @@
 use bytemuck;
 use cgmath;
 use cgmath::num_traits::clamp;
+use noise::NoiseFn;
 use std::mem;
 use std::time::Duration;
 use wgpu::{self, util::DeviceExt};
@@ -146,6 +147,9 @@ pub struct State {
     pub camera_uniform: CameraUniform,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
+    noise: noise::SuperSimplex,
+    chunk_data: Vec<u32>,
+    chunk_data_buffer: wgpu::Buffer,
     wire_cube_vertex_buffer: wgpu::Buffer,
     wire_cube_index_buffer: wgpu::Buffer,
     wire_cube_instances: Vec<InstanceRaw>,
@@ -250,6 +254,14 @@ impl State {
         let gbuffer_storage_texture =
             StorageTexture::create_storage_texture(&device, &config, "GBuffer Storage Texture");
 
+        let chunk_data = vec![0; CHUNK_LOAD_DIAMETER.pow(3)];
+
+        let chunk_data_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Chunk Data Buffer"),
+            contents: bytemuck::cast_slice(&chunk_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let camera = Camera::new((0.5, 0.5, 0.5), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
             Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
@@ -269,7 +281,7 @@ impl State {
                 label: Some("Camera Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -315,25 +327,45 @@ impl State {
         let gbuffer_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("GBuffer Compute Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let gbuffer_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("GBuffer Compute Bind Group"),
             layout: &gbuffer_compute_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&gbuffer_storage_texture.view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&gbuffer_storage_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        chunk_data_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+            ],
         });
 
         let render_pipeline_layout =
@@ -429,7 +461,10 @@ impl State {
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Compute Pipeline Layout"),
-                bind_group_layouts: &[&gbuffer_compute_bind_group_layout],
+                bind_group_layouts: &[
+                    &camera_bind_group_layout,
+                    &gbuffer_compute_bind_group_layout,
+                ],
                 push_constant_ranges: &[],
             });
 
@@ -518,6 +553,9 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            noise: noise::SuperSimplex::new(0),
+            chunk_data,
+            chunk_data_buffer,
             wire_cube_vertex_buffer,
             wire_cube_index_buffer,
             wire_cube_instances,
@@ -557,13 +595,21 @@ impl State {
             self.gbuffer_compute_bind_group =
                 self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("GBuffer Compute Bind Group"),
-                    layout: &self.compute_pipeline.get_bind_group_layout(0),
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.gbuffer_storage_texture.view,
-                        ),
-                    }],
+                    layout: &self.compute_pipeline.get_bind_group_layout(1),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.gbuffer_storage_texture.view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(
+                                self.chunk_data_buffer.as_entire_buffer_binding(),
+                            ),
+                        },
+                    ],
                 });
             self.debug_depth_texture =
                 Texture::create_depth_texture(&self.device, &self.config, "Debug Depth Texture");
@@ -690,6 +736,12 @@ impl State {
 
                         // TODO: Load new chunk
 
+                        let chunk = self.noise.get([
+                            chunk_coord.x as f64 / 16.0,
+                            chunk_coord.y as f64 / 16.0,
+                            chunk_coord.z as f64 / 16.0,
+                        ]);
+
                         let instance = Instance {
                             position: cgmath::Vector3 {
                                 x: ((current_player_chunk.x as isize - CHUNK_LOAD_RADIUS_ISIZE
@@ -715,6 +767,8 @@ impl State {
                             chunk_coord.y.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32) +
                             chunk_coord.z.rem_euclid(CHUNK_LOAD_DIAMETER_I32);
 
+                        self.chunk_data[idx as usize] = (chunk * 255.0) as u32;
+
                         self.wire_cube_instances[idx as usize] = instance;
 
                         loaded_chunks_count += 1;
@@ -725,6 +779,12 @@ impl State {
             self.player_chunk = current_player_chunk;
 
             println!("Loaded {} chunks", loaded_chunks_count);
+
+            self.queue.write_buffer(
+                &self.chunk_data_buffer,
+                0,
+                bytemuck::cast_slice(&self.chunk_data),
+            );
 
             self.queue.write_buffer(
                 &self.wire_cube_instance_buffer,
@@ -760,7 +820,10 @@ impl State {
             });
 
             compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.gbuffer_compute_bind_group, &[]);
+
+            compute_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.gbuffer_compute_bind_group, &[]);
+
             compute_pass.dispatch_workgroups(self.config.width, self.config.height, 1);
         }
 
@@ -781,7 +844,9 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
+
             render_pass.set_bind_group(0, &self.gbuffer_render_bind_group, &[]);
+
             render_pass.draw(0..3, 0..1);
         }
 
