@@ -15,36 +15,37 @@ var gbuffer: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(1)
 var<storage, read> chunk_data: array<u32>;
 
-struct Insterction {
+struct Intersection {
     t: f32,
     hit: bool,
 };
 
-fn intersect_sphere(ray_origin: vec3<f32>, ray_dir: vec3<f32>, sphere_center: vec3<f32>, sphere_radius: f32) -> Insterction {
-    let oc = ray_origin - sphere_center;
+fn intersect_box(ray_origin: vec3<f32>, ray_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> Intersection {
+    let inv_ray_dir = 1.0 / ray_dir;
 
-    let a = dot(ray_dir, ray_dir);
-    let b = 2.0 * dot(oc, ray_dir);
-    let c = dot(oc, oc) - sphere_radius * sphere_radius;
+    let tx1 = (box_min.x - ray_origin.x) * inv_ray_dir.x;
+    let tx2 = (box_max.x - ray_origin.x) * inv_ray_dir.x;
 
-    let delta = b * b - 4.0 * a * c;
-    if delta < 0.0 {
-        return Insterction(0.0, false);
+    var tmin = min(tx1, tx2);
+    var tmax = max(tx1, tx2);
+
+    let ty1 = (box_min.y - ray_origin.y) * inv_ray_dir.y;
+    let ty2 = (box_max.y - ray_origin.y) * inv_ray_dir.y;
+
+    tmin = max(tmin, min(ty1, ty2));
+    tmax = min(tmax, max(ty1, ty2));
+
+    let tz1 = (box_min.z - ray_origin.z) * inv_ray_dir.z;
+    let tz2 = (box_max.z - ray_origin.z) * inv_ray_dir.z;
+
+    tmin = max(tmin, min(tz1, tz2));
+    tmax = min(tmax, max(tz1, tz2));
+
+    if tmax > max(tmin, 0.0) {
+        return Intersection(tmin, true);
     }
 
-    let sqrt_delta = sqrt(delta);
-    let r1 = (-b - sqrt_delta) / (2.0 * a);
-    let r2 = (-b + sqrt_delta) / (2.0 * a);
-
-    if r1 > 0.0 {
-        return Insterction(r1, true);
-    }
-
-    if r2 > 0.0 {
-        return Insterction(r2, true);
-    }
-
-    return Insterction(0.0, false);
+    return Intersection(0.0, false);
 }
 
 @compute
@@ -73,23 +74,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let ray_dir = normalize(pixel_pos_world.xyz - camera.position.xyz);
 
-    var spheres = array<vec3<f32>, 7>(
-        vec3<f32>(-4.0, 0.0, 0.0),
-        vec3<f32>(0.0, -4.0, 0.0),
-        vec3<f32>(0.0, 0.0, -4.0),
-        vec3<f32>(0.0, 0.0, 0.0),
-        vec3<f32>(4.0, 0.0, 0.0),
-        vec3<f32>(0.0, 4.0, 0.0),
-        vec3<f32>(0.0, 0.0, 4.0),
-    );
+    let box_min = vec3<f32>(-1.0, -1.0, -1.0);
+    let box_max = vec3<f32>(1.0, 1.0, 1.0);
 
-    for (var i = 0; i < 7; i += 1) {
-        let intersection = intersect_sphere(camera.position.xyz, ray_dir, spheres[i], 0.5);
-        if intersection.hit {
-            let color = vec4<f32>(1.0, 0.0, 0.0, 1.0);
-            textureStore(gbuffer, coords, color);
-            return;
-        }
+    let intersection = intersect_box(camera.position.xyz, ray_dir, box_min, box_max);
+    if intersection.hit {
+        let color = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        textureStore(gbuffer, coords, color);
+        return;
     }
 
     let color = vec4<f32>(0.0, 0.0, 0.0, 1.0);

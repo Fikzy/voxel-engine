@@ -155,6 +155,7 @@ pub struct State {
     wire_cube_instances: Vec<InstanceRaw>,
     wire_cube_instance_buffer: wgpu::Buffer,
     player_chunk: cgmath::Vector3<i32>,
+    pub debug: bool,
     pub mouse_pressed: bool,
     pub mouse_grabbed: bool,
     // The window must be declared after the surface so
@@ -561,6 +562,7 @@ impl State {
             wire_cube_instances,
             wire_cube_instance_buffer,
             player_chunk: cgmath::Vector3::new(0, 0, 0),
+            debug: true,
             mouse_pressed: false,
             mouse_grabbed: false,
         }
@@ -630,6 +632,12 @@ impl State {
             WindowEvent::KeyboardInput { event, .. } => {
                 match event.physical_key {
                     PhysicalKey::Code(key_code) => match key_code {
+                        KeyCode::F1 => {
+                            if event.state.is_pressed() {
+                                self.debug = !self.debug;
+                                return true;
+                            }
+                        }
                         KeyCode::Escape => {
                             if self.mouse_grabbed && event.state.is_pressed() {
                                 self.mouse_pressed = false;
@@ -850,7 +858,7 @@ impl State {
             render_pass.draw(0..3, 0..1);
         }
 
-        {
+        if self.debug {
             let mut debug_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Debug Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
