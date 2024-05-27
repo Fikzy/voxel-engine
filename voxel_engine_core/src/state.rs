@@ -263,7 +263,7 @@ impl State {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera = Camera::new((0.5, 0.5, 0.5), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
+        let camera = Camera::new((0.0, 0.0, 64.0), cgmath::Deg(-90.0), cgmath::Deg(0.0));
         let projection =
             Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
         let camera_controller = CameraController::new(10.0, 20.0, 0.2);
@@ -562,7 +562,7 @@ impl State {
             wire_cube_instances,
             wire_cube_instance_buffer,
             player_chunk: cgmath::Vector3::new(0, 0, 0),
-            debug: true,
+            debug: false,
             mouse_pressed: false,
             mouse_grabbed: false,
         }
