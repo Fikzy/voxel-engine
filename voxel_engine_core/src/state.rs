@@ -156,6 +156,7 @@ pub struct State {
     wire_cube_instance_buffer: wgpu::Buffer,
     player_chunk: cgmath::Vector3<i32>,
     pub debug: bool,
+    pub debug_disable_chunk_loading: bool,
     pub mouse_pressed: bool,
     pub mouse_grabbed: bool,
     // The window must be declared after the surface so
@@ -563,6 +564,7 @@ impl State {
             wire_cube_instance_buffer,
             player_chunk: cgmath::Vector3::new(0, 0, 0),
             debug: false,
+            debug_disable_chunk_loading: false,
             mouse_pressed: false,
             mouse_grabbed: false,
         }
@@ -684,7 +686,9 @@ impl State {
             (self.camera.position.y / CHUNK_SIZE as f32).floor() as i32,
             (self.camera.position.z / CHUNK_SIZE as f32).floor() as i32,
         );
-        if current_player_chunk != self.player_chunk {
+        if current_player_chunk != self.player_chunk && !self.debug_disable_chunk_loading {
+            self.debug_disable_chunk_loading = true;
+
             println!("Player moved to chunk: {:?}", current_player_chunk);
 
             let mut displacement = current_player_chunk - self.player_chunk;
