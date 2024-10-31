@@ -1,7 +1,8 @@
 use bytemuck;
-use cgmath;
 use cgmath::num_traits::clamp;
+use cgmath::{self, Vector3};
 use noise::NoiseFn;
+use std::io::empty;
 use std::mem;
 use std::time::Duration;
 use wgpu::{self, util::DeviceExt};
@@ -114,7 +115,8 @@ impl InstanceRaw {
 // 1 unit = 1 meter
 // 16^3 voxels per unit
 // 64^3 voxels per chunk
-const CHUNK_SIZE: usize = 4;
+const CHUNK_SIZE: u32 = 64;
+const MAX_DEPTH: u32 = 5;
 
 // 16^3 chunks = 4096 chunks loaded around the player
 // Number of chunks to load in each direction from the player
@@ -497,37 +499,6 @@ impl State {
             CHUNK_LOAD_DIAMETER.pow(3)
         ];
 
-        // Load chunks at the origin
-        for x in 0..CHUNK_LOAD_DIAMETER {
-            for y in 0..CHUNK_LOAD_DIAMETER {
-                for z in 0..CHUNK_LOAD_DIAMETER {
-                    let chunk_coord = -CHUNK_LOAD_RADIUS_VEC3_I32
-                        + cgmath::Vector3::new(x as i32, y as i32, z as i32);
-
-                    let instance = Instance {
-                        position: cgmath::Vector3 {
-                            x: ((x as isize - CHUNK_LOAD_RADIUS_ISIZE) * CHUNK_SIZE as isize)
-                                as f32,
-                            y: ((y as isize - CHUNK_LOAD_RADIUS_ISIZE) * CHUNK_SIZE as isize)
-                                as f32,
-                            z: ((z as isize - CHUNK_LOAD_RADIUS_ISIZE) * CHUNK_SIZE as isize)
-                                as f32,
-                        },
-                        scale: CHUNK_SIZE as f32,
-                    }
-                    .to_raw();
-
-                    #[rustfmt::skip]
-                    let idx =
-                        chunk_coord.x.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32).pow(2) +
-                        chunk_coord.y.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32) +
-                        chunk_coord.z.rem_euclid(CHUNK_LOAD_DIAMETER_I32);
-
-                    wire_cube_instances[idx as usize] = instance;
-                }
-            }
-        }
-
         let wire_cube_instance_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Wire Cube Instance Buffer"),
@@ -676,6 +647,171 @@ impl State {
         }
     }
 
+    /// Generate a chunk of voxels
+    /// * `depth` - The current depth in the octree
+    /// * `octant_indices` - The indices of the octant in the parent octant
+    pub fn generate_chunk(&mut self, depth: u32, mut octant_indices: Vector3<u32>) -> Vec<u32> {
+        let mut chunk_data = Vec::<u32>::new();
+
+        if depth == 0 {
+            for idx in 0..8 {
+                octant_indices.x |= (idx & 0b100 >> 2) << depth;
+                octant_indices.y |= (idx & 0b010 >> 1) << depth;
+                octant_indices.z |= (idx & 0b001 >> 0) << depth;
+                self.generate_chunk(depth + 1, octant_indices);
+            }
+
+            let child_descriptor = 0u32;
+            chunk_data.push(0); // First chunk descriptor 
+        }
+
+        if depth == MAX_DEPTH {
+            let mut octant_coord = Vector3::new(0, 0, 0);
+
+            for d in 0..depth {
+                octant_coord.x += ((octant_indices.x & 1 << d) >> d) * (CHUNK_SIZE >> (d + 1));
+                octant_coord.y += ((octant_indices.y & 1 << d) >> d) * (CHUNK_SIZE >> (d + 1));
+                octant_coord.z += ((octant_indices.z & 1 << d) >> d) * (CHUNK_SIZE >> (d + 1));
+            }
+            println!(
+                "Creating leaf voxel at: {}, {}, {}",
+                octant_coord.x, octant_coord.y, octant_coord.z
+            );
+
+            let mut valid_mask = 0u32;
+            let mut leaf_mask = 0u32;
+            for idx in 0..8 {
+                let voxel_coord = cgmath::Vector3::new(
+                    octant_coord.x + (idx & 0b100 >> 2),
+                    octant_coord.y + (idx & 0b010 >> 1),
+                    octant_coord.z + (idx & 0b001 >> 0),
+                );
+                let voxel = self.noise.get([
+                    voxel_coord.x as f64 / CHUNK_SIZE as f64,
+                    voxel_coord.y as f64 / CHUNK_SIZE as f64,
+                    voxel_coord.z as f64 / CHUNK_SIZE as f64,
+                ]);
+                if voxel > 0.0 {
+                    valid_mask |= 1 << idx;
+                    leaf_mask |= 1 << idx;
+                }
+            }
+
+            let mut child_descriptor = 0u32;
+            child_descriptor |= valid_mask << 8;
+            child_descriptor |= leaf_mask;
+
+            return vec![child_descriptor];
+        }
+
+        for x in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    // let voxel_coord = cgmath::Vector3::new(
+                    //     current_player_chunk.x * CHUNK_SIZE as i32 + x as i32,
+                    //     current_player_chunk.y * CHUNK_SIZE as i32 + y as i32,
+                    //     current_player_chunk.z * CHUNK_SIZE as i32 + z as i32,
+                    // );
+
+                    // let voxel = self.noise.get([
+                    //     voxel_coord.x as f64 / CHUNK_SIZE as f64,
+                    //     voxel_coord.y as f64 / CHUNK_SIZE as f64,
+                    //     voxel_coord.z as f64 / CHUNK_SIZE as f64,
+                    // ]);
+
+                    let voxel = self.noise.get([
+                        x as f64 / CHUNK_SIZE as f64,
+                        y as f64 / CHUNK_SIZE as f64,
+                        z as f64 / CHUNK_SIZE as f64,
+                    ]);
+
+                    if voxel > 0.0 {
+                        let mut idx = 0;
+                        let mut depth = 1;
+                        let mut octant_coord: Vector3<u32> = Vector3::new(0, 0, 0);
+
+                        loop {
+                            let mut child_descriptor = chunk_data[idx];
+                            let mut child_pointer = child_descriptor & 0xfffe0000 >> 17;
+                            let mut valid_mask = child_descriptor & 0xff00 >> 8;
+                            let mut leaf_mask = child_descriptor & 0xff;
+
+                            // FIXME: children must be stored contiguously
+
+                            if depth == MAX_DEPTH {
+                                // Set leaf mask
+                                println!("Creating leaf voxel at: {}, {}, {}", x, y, z);
+
+                                octant_coord.x =
+                                    (x - octant_coord.x * CHUNK_SIZE) / (CHUNK_SIZE >> depth);
+                                octant_coord.y =
+                                    (y - octant_coord.y * CHUNK_SIZE) / (CHUNK_SIZE >> depth);
+                                octant_coord.z =
+                                    (z - octant_coord.z * CHUNK_SIZE) / (CHUNK_SIZE >> depth);
+                                let octant_idx =
+                                    octant_coord.x << 2 | octant_coord.y << 1 | octant_coord.z;
+
+                                valid_mask |= 1 << octant_idx;
+                                leaf_mask |= 1 << octant_idx;
+
+                                println!("Valid mask: {:b}", valid_mask);
+                                println!("Leaf mask: {:b}", leaf_mask);
+
+                                child_descriptor |= valid_mask << 8;
+                                child_descriptor |= leaf_mask;
+
+                                chunk_data[idx] = child_descriptor; // Update parent descriptor
+
+                                break;
+                            }
+
+                            if child_pointer == 0 {
+                                // Create new children
+                                println!("Creating new children for voxel: {}, {}, {}", x, y, z);
+                                println!("Idx: {:?}", idx);
+                                println!("Depth: {:?}", depth);
+                                println!("Octant coord: {:?}", octant_coord);
+
+                                octant_coord.x =
+                                    (x - octant_coord.x * CHUNK_SIZE) / (CHUNK_SIZE >> depth);
+                                octant_coord.y =
+                                    (y - octant_coord.y * CHUNK_SIZE) / (CHUNK_SIZE >> depth);
+                                octant_coord.z =
+                                    (z - octant_coord.z * CHUNK_SIZE) / (CHUNK_SIZE >> depth);
+                                let octant_idx =
+                                    octant_coord.x << 2 | octant_coord.y << 1 | octant_coord.z;
+
+                                chunk_data.push(0); // New chunk descriptor
+
+                                child_pointer = chunk_data.len() as u32;
+                                valid_mask |= 1 << octant_idx;
+
+                                println!("Valid mask: {:b}", valid_mask);
+
+                                child_descriptor |= child_pointer << 17;
+                                child_descriptor |= valid_mask << 8;
+                                chunk_data[idx] = child_descriptor; // Update parent descriptor
+
+                                idx = child_pointer as usize;
+                                depth += 1;
+
+                                continue;
+                            } else {
+                                // Traverse children
+                                println!("Traversing children for voxel: {}, {}, {}", x, y, z);
+                                idx = child_pointer as usize;
+                                depth += 1; // FIXME: wrong
+                            }
+                        }
+
+                        println!();
+                    }
+                }
+            }
+        }
+        chunk_data
+    }
+
     pub fn update(&mut self, dt: Duration) {
         self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform
@@ -691,106 +827,10 @@ impl State {
 
             println!("Player moved to chunk: {:?}", current_player_chunk);
 
-            let mut displacement = current_player_chunk - self.player_chunk;
-            displacement.x = clamp(
-                displacement.x,
-                -CHUNK_LOAD_DIAMETER_I32,
-                CHUNK_LOAD_DIAMETER_I32,
-            );
-            displacement.y = clamp(
-                displacement.y,
-                -CHUNK_LOAD_DIAMETER_I32,
-                CHUNK_LOAD_DIAMETER_I32,
-            );
-            displacement.z = clamp(
-                displacement.z,
-                -CHUNK_LOAD_DIAMETER_I32,
-                CHUNK_LOAD_DIAMETER_I32,
-            );
-            // println!("Displacement: {:?}", displacement);
-
-            #[rustfmt::skip]
-            let valid_start = self.player_chunk - CHUNK_LOAD_RADIUS_VEC3_I32 + cgmath::Vector3::new(
-                if displacement.x < 0 { 0 } else { displacement.x },
-                if displacement.y < 0 { 0 } else { displacement.y },
-                if displacement.z < 0 { 0 } else { displacement.z },
-            );
-
-            #[rustfmt::skip]
-            let valid_end = self.player_chunk + CHUNK_LOAD_RADIUS_VEC3_I32 + cgmath::Vector3::new(
-                if displacement.x < 0 { displacement.x } else { 0 },
-                if displacement.y < 0 { displacement.y } else { 0 },
-                if displacement.z < 0 { displacement.z } else { 0 },
-            );
-
-            // println!("Valid start: {:?}, end: {:?}", valid_start, valid_end);
-
-            let mut loaded_chunks_count = 0;
-
-            // FIXME: iterate only over the chunks that need to be loaded?
-            for x in 0..CHUNK_LOAD_DIAMETER {
-                for y in 0..CHUNK_LOAD_DIAMETER {
-                    for z in 0..CHUNK_LOAD_DIAMETER {
-                        let chunk_coord = current_player_chunk - CHUNK_LOAD_RADIUS_VEC3_I32
-                            + cgmath::Vector3::new(x as i32, y as i32, z as i32);
-
-                        if chunk_coord.x >= valid_start.x
-                            && chunk_coord.x < valid_end.x
-                            && chunk_coord.y >= valid_start.y
-                            && chunk_coord.y < valid_end.y
-                            && chunk_coord.z >= valid_start.z
-                            && chunk_coord.z < valid_end.z
-                        {
-                            continue;
-                        }
-
-                        // TODO: Unload old chunk
-
-                        // TODO: Load new chunk
-
-                        let chunk = self.noise.get([
-                            chunk_coord.x as f64 / 16.0,
-                            chunk_coord.y as f64 / 16.0,
-                            chunk_coord.z as f64 / 16.0,
-                        ]);
-
-                        let instance = Instance {
-                            position: cgmath::Vector3 {
-                                x: ((current_player_chunk.x as isize - CHUNK_LOAD_RADIUS_ISIZE
-                                    + x as isize)
-                                    * CHUNK_SIZE as isize)
-                                    as f32,
-                                y: ((current_player_chunk.y as isize - CHUNK_LOAD_RADIUS_ISIZE
-                                    + y as isize)
-                                    * CHUNK_SIZE as isize)
-                                    as f32,
-                                z: ((current_player_chunk.z as isize - CHUNK_LOAD_RADIUS_ISIZE
-                                    + z as isize)
-                                    * CHUNK_SIZE as isize)
-                                    as f32,
-                            },
-                            scale: CHUNK_SIZE as f32,
-                        }
-                        .to_raw();
-
-                        #[rustfmt::skip]
-                        let idx =
-                            chunk_coord.x.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32).pow(2) +
-                            chunk_coord.y.rem_euclid(CHUNK_LOAD_DIAMETER_I32) * (CHUNK_LOAD_DIAMETER_I32) +
-                            chunk_coord.z.rem_euclid(CHUNK_LOAD_DIAMETER_I32);
-
-                        self.chunk_data[idx as usize] = (chunk * 255.0) as u32;
-
-                        self.wire_cube_instances[idx as usize] = instance;
-
-                        loaded_chunks_count += 1;
-                    }
-                }
-            }
+            let new_chunk_data = self.generate_chunk(0, Vector3::new(0, 0, 0));
+            // Copy new chunk data to chunk data buffer
 
             self.player_chunk = current_player_chunk;
-
-            println!("Loaded {} chunks", loaded_chunks_count);
 
             self.queue.write_buffer(
                 &self.chunk_data_buffer,
