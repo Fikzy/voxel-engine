@@ -711,7 +711,7 @@ impl State {
                 Some((mut child_descriptor, child_data)) => {
                     if !child_data.is_empty() {
                         child_descriptor |=
-                            ((children_descriptors.len() + children_data.len()) as u32) << 17; // Offset to children data
+                            ((children_descriptors.len() + children_data.len()) as u32) << 16; // Offset to children data
                         children_data.extend(child_data);
                     }
                     children_descriptors.push(child_descriptor);
@@ -726,8 +726,6 @@ impl State {
         }
 
         let mut child_descriptor = 0u32;
-        child_descriptor |= 1 << 17; // Offset to children data for root node
-
         child_descriptor |= valid_mask << 8;
 
         let mut data = vec![child_descriptor];
@@ -753,7 +751,9 @@ impl State {
             println!("Player moved to chunk: {:?}", current_player_chunk);
 
             match self.generate_chunk(0, Vector3::new(0, 0, 0)) {
-                Some((child_descriptor, data)) => {
+                Some((mut child_descriptor, data)) => {
+                    child_descriptor |= 1 << 16; // Offset to children data for root node
+
                     // self.chunk_data[0] = child_descriptor;
                     // self.chunk_data.extend(data);
                     println!("Generated chunk child descriptor: {:b}", child_descriptor);

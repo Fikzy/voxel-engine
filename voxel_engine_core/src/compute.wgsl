@@ -1,9 +1,9 @@
 const PI = 3.1415926535897932384626433832795;
 
 const RAY_EPSILON = 0.0001;
-const MAX_ITERATION = 50u;
+const MAX_RAYCAST_ITERATIONS = 10000u;
 
-const S_MAX = 23u;
+const CAST_STACK_DEPTH = 23u;
 
 const CHUNK_SIZE = 8u;
 // const MAX_DEPTH = log2(CHUNK_SIZE) - 1;
@@ -117,68 +117,87 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // var color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     var color = vec4<f32>(0.53, 0.81, 0.92, 1.0); // sky blue
 
-    let chunk_min = player_chunk * f32(CHUNK_SIZE) + RAY_EPSILON;
-    let chunk_max = (player_chunk + 1.0) * f32(CHUNK_SIZE) - RAY_EPSILON;
+    var bbox_min = player_chunk * f32(CHUNK_SIZE) + RAY_EPSILON;
+    var bbox_max = (player_chunk + 1.0) * f32(CHUNK_SIZE) - RAY_EPSILON;
 
-    var intersection = intersect_box(camera.position.xyz, inv_ray_dir, chunk_min, chunk_max);
+    var intersection = intersect_box(camera.position.xyz, inv_ray_dir, bbox_min, bbox_max);
 
-    var t_coef = vec3<f32>(-inv_ray_dir.x, -inv_ray_dir.y, -inv_ray_dir.z);
-    var t_bias = vec3<f32>(camera.position.x * t_coef.x, camera.position.y * t_coef.y, camera.position.z * t_coef.z);
+    if (intersection.tmax < 0 || intersection.tmin >= intersection.tmax) {
+        textureStore(gbuffer, coords, color);
+        return;
+    }
 
-    if intersection.tmax >= max(intersection.tmin, 0.0) {
+    var intersection_point = camera.position.xyz;
 
-        var intersection_point = camera.position.xyz;
+    if intersection.tmin >= 0.0 { // if the ray starts outside the grid
+        intersection_point += ray_dir * intersection.tmin;
+    }
 
-        if intersection.tmin >= 0.0 { // if the ray starts outside the grid
-            intersection_point += ray_dir * intersection.tmin;
+    var node_index = 0u; // root node index
+    var child_descriptor = chunk_data[node_index];
+
+    var bbox_middle = (bbox_min + bbox_max) / 2.0;
+    var x = u32(intersection_point.x < bbox_middle.x);
+    var y = u32(intersection_point.y < bbox_middle.y);
+    var z = u32(intersection_point.z < bbox_middle.z);
+    var octant_size = f32(CHUNK_SIZE / 2u);
+    var pos = vec3<f32>(f32(x), f32(y), f32(z)) * octant_size;
+    var idx = (x << 2u) | (y << 1u) | z;
+
+    let stack = array<u32, CAST_STACK_DEPTH>();
+    var scale = CAST_STACK_DEPTH - 1u;
+    var scale_exp2 = 0.5;
+
+    var iter = 0u;
+
+    while (scale < CAST_STACK_DEPTH) {
+        if (iter > 256u) {
+            break;
         }
 
-        intersection_point = clamp(intersection_point, chunk_min, chunk_max);
+        bbox_max = vec3<f32>(pos.x + octant_size, pos.y + octant_size, pos.z + octant_size);
+        intersection = intersect_box(camera.position.xyz, inv_ray_dir, pos, bbox_max);
 
-        let chunk_middle = (chunk_min + chunk_max) / 2.0;
+        var child_offset = (child_descriptor & 0xfffe0000u) >> 17u;
+        var far          = (child_descriptor & 0x00010000u) >>  9u;
+        var valid_mask   = (child_descriptor & 0x0000ff00u) >>  8u;
+        var leaf_mask    = (child_descriptor & 0x000000ffu);
 
-        var parent = chunk_data[0]; // root node
-        var child_descriptor = 0u;
-    
-        var x = u32(intersection_point.x < chunk_middle.x);
-        var y = u32(intersection_point.y < chunk_middle.y);
-        var z = u32(intersection_point.z < chunk_middle.z);
-        var octant_size = f32(CHUNK_SIZE / 2u);
-        var pos = vec3<f32>(f32(x), f32(y), f32(z)) * octant_size;
-        var idx = (x << 2u) | (y << 1u) | z;
+        let child_mask = 1u << idx;
 
-        // var t_corner = vec3<f32>(camera.position.x * t_coef.x - t_bias.x,
-        //                          camera.position.y * t_coef.y - t_bias.y,
-        //                          camera.position.z * t_coef.z - t_bias.z);
-        // var tc_max = min(t_corner.x, t_corner.y, t_corner.z);
+        // If voxel exists and the ray intersects the box
+        if (valid_mask & child_mask) != 0u && intersection.tmin <= intersection.tmax {
 
-        let stack = array<u32, S_MAX>();
-        var scale = S_MAX - 1u;
-        var scale_exp2 = 0.5;
+            // TODO: Terminate if voxel is small enough (LOD feature?)
 
-        while true {
-            var box_max = vec3<f32>(pos.x + octant_size, pos.y + octant_size, pos.z + octant_size);
-            intersection = intersect_box(camera.position.xyz, inv_ray_dir, pos, box_max);
-
-            var child_descriptor = parent;
-            var child_masks = (parent & 0xff00u) >> 8u;
-
-            // If voxel exists and the ray intersects the box
-            if (child_masks & (1u << idx)) != 0u && intersection.tmin <= intersection.tmax {
-
-                // Terminate if voxel is small enough
-                // TODO: not sure how to do this?
-
-                color = vec4<f32>(f32(idx) / 8.0, 0.0, 0.0, 1.0);
+            // If leaf, end ray
+            if ((leaf_mask & child_mask) != 0u) {
+                color = vec4<f32>(f32(idx / 8u), 0.0, 0.0, 1.0);
                 break;
             }
+
+            color = vec4<f32>(f32(idx / 8u), 0.0, 0.0, 1.0);
+            break;
+
+            // node_index += child_offset;
+            // child_descriptor = chunk_data[node_index];
+
+            // bbox_middle = (pos + bbox_max) / 2.0;
+            // x = u32(intersection_point.x < bbox_middle.x);
+            // y = u32(intersection_point.y < bbox_middle.y);
+            // z = u32(intersection_point.z < bbox_middle.z);
+            // octant_size = octant_size / 2.0;
+            // pos = vec3<f32>(f32(x), f32(y), f32(z)) * octant_size;
+            // idx = (x << 2u) | (y << 1u) | z;
         }
 
-        // let valid_mask = (parent & 0xff00u) >> 8u;
-        // if (valid_mask & (1u << idx)) != 0u {
-        //     color = vec4<f32>(f32(idx) / 8.0, 0.0, 0.0, 1.0);
-        // }
+        iter++;
     }
+
+    // let valid_mask = (parent & 0xff00u) >> 8u;
+    // if (valid_mask & (1u << idx)) != 0u {
+    //     color = vec4<f32>(f32(idx) / 8.0, 0.0, 0.0, 1.0);
+    // }
 
     // Notes:
     // - use popcount to count the number of bits set to 1
