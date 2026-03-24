@@ -1,24 +1,12 @@
 [package]
 name = "voxel-engine"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-pollster = "0.3.0"
-voxel_engine_core = { path = "./voxel_engine_core" }
-
-[workspace]
-members = [
-    "voxel_engine_core"
-]
-
-[workspace.dependencies]
-# anyhow = "1.0.75"
-bytemuck = { version = "1.12", default-features = false }
-circular-queue = "0.2.6"
-cgmath = "0.18.0"
-env_logger = "0.10.1"
-log = "0.4.20"
-noise = "0.8.2"
-wgpu = "0.18.0"
-winit = { version = "0.29.3", default-features = false }
+anyhow = "1.0.102"
+env_logger = "0.11.10"
+log = "0.4.29"
+pollster = "0.4.0"
+wgpu = "28.0.0"
+winit = "0.30.13"

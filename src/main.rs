@@ -1,6 +1,5 @@
-use pollster;
-use voxel_engine_core;
+use voxel_engine::run;
 
 fn main() {
-    pollster::block_on(voxel_engine_core::run());
+    run().unwrap();
 }
