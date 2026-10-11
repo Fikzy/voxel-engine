@@ -1,21 +1,66 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::WindowEvent,
+    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
+use crate::camera::Camera;
+use crate::camera::controller::CameraController;
 use crate::renderer::Renderer;
 
-#[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     startup_error: Option<anyhow::Error>,
+    camera: Camera,
+    camera_controller: CameraController,
+    last_frame: Instant,
+    mouse_look_active: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            window: None,
+            renderer: None,
+            startup_error: None,
+            camera: Camera::default(),
+            camera_controller: CameraController::default(),
+            last_frame: Instant::now(),
+            mouse_look_active: false,
+        }
+    }
+}
+
+impl App {
+    fn set_mouse_look(&mut self, active: bool) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        self.mouse_look_active = active;
+        self.camera_controller.clear_input();
+        if active {
+            if window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+                .is_ok()
+            {
+                window.set_cursor_visible(false);
+            } else {
+                self.mouse_look_active = false;
+            }
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -41,11 +86,25 @@ impl ApplicationHandler for App {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 self.window = Some(window);
+                self.last_frame = Instant::now();
             }
             Err(error) => {
                 self.startup_error = Some(error);
                 event_loop.exit();
             }
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if self.mouse_look_active
+            && let DeviceEvent::MouseMotion { delta } = event
+        {
+            self.camera_controller.process_mouse_motion(delta);
         }
     }
 
@@ -65,14 +124,39 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => self.set_mouse_look(false),
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state: ElementState::Pressed,
+                ..
+            } if !self.mouse_look_active => self.set_mouse_look(true),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                    && event.state.is_pressed()
+                    && !event.repeat
+                {
+                    if self.mouse_look_active {
+                        self.set_mouse_look(false);
+                    } else {
+                        event_loop.exit();
+                    }
+                } else {
+                    self.camera_controller.process_key(&event);
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size);
                 }
             }
             WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                self.camera_controller
+                    .update(&mut self.camera, now - self.last_frame);
+                self.last_frame = now;
                 if let Some(renderer) = &mut self.renderer
-                    && let Err(error) = renderer.render()
+                    && let Err(error) =
+                        renderer.render(self.camera.view_projection(renderer.aspect_ratio()))
                 {
                     self.startup_error = Some(error);
                     event_loop.exit();
