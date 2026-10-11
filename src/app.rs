@@ -155,8 +155,10 @@ impl ApplicationHandler for App {
                     .update(&mut self.camera, now - self.last_frame);
                 self.last_frame = now;
                 if let Some(renderer) = &mut self.renderer
-                    && let Err(error) =
-                        renderer.render(self.camera.view_projection(renderer.aspect_ratio()))
+                    && let Err(error) = renderer.render(
+                        self.camera.view_projection(renderer.aspect_ratio()),
+                        self.camera.position,
+                    )
                 {
                     self.startup_error = Some(error);
                     event_loop.exit();

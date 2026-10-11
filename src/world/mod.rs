@@ -1,6 +1,6 @@
 mod chunk;
 
-pub use chunk::{CHUNK_EDGE, Chunk, ChunkCoord};
+pub use chunk::{CHUNK_EDGE, Chunk, ChunkCoord, RayHit};
 
 use std::collections::HashMap;
 
