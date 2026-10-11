@@ -14,6 +14,7 @@ use winit::{
 use crate::camera::Camera;
 use crate::camera::controller::CameraController;
 use crate::renderer::Renderer;
+use crate::world::{STREAM_RADIUS, World};
 
 struct App {
     window: Option<Arc<Window>>,
@@ -21,6 +22,8 @@ struct App {
     startup_error: Option<anyhow::Error>,
     camera: Camera,
     camera_controller: CameraController,
+    world: World,
+    debug_visualization: bool,
     last_frame: Instant,
     mouse_look_active: bool,
 }
@@ -33,6 +36,8 @@ impl Default for App {
             startup_error: None,
             camera: Camera::default(),
             camera_controller: CameraController::default(),
+            world: World::default(),
+            debug_visualization: false,
             last_frame: Instant::now(),
             mouse_look_active: false,
         }
@@ -72,7 +77,7 @@ impl ApplicationHandler for App {
         let window = match event_loop.create_window(
             Window::default_attributes()
                 .with_title("Voxel Engine")
-                .with_inner_size(PhysicalSize::new(1280, 720)),
+                .with_inner_size(PhysicalSize::new(1920, 1080)),
         ) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -82,7 +87,9 @@ impl ApplicationHandler for App {
             }
         };
 
-        match pollster::block_on(Renderer::new(window.clone())) {
+        self.world
+            .stream_around(self.camera.position, STREAM_RADIUS);
+        match pollster::block_on(Renderer::new(window.clone(), &self.world)) {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 self.window = Some(window);
@@ -131,7 +138,15 @@ impl ApplicationHandler for App {
                 ..
             } if !self.mouse_look_active => self.set_mouse_look(true),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                if event.physical_key == PhysicalKey::Code(KeyCode::F1)
+                    && event.state.is_pressed()
+                    && !event.repeat
+                {
+                    self.debug_visualization = !self.debug_visualization;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_debug_visualization(self.debug_visualization);
+                    }
+                } else if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     && event.state.is_pressed()
                     && !event.repeat
                 {
@@ -154,14 +169,20 @@ impl ApplicationHandler for App {
                 self.camera_controller
                     .update(&mut self.camera, now - self.last_frame);
                 self.last_frame = now;
-                if let Some(renderer) = &mut self.renderer
-                    && let Err(error) = renderer.render(
+                let world_changed = self
+                    .world
+                    .stream_around(self.camera.position, STREAM_RADIUS);
+                if let Some(renderer) = &mut self.renderer {
+                    if world_changed {
+                        renderer.update_world(&self.world);
+                    }
+                    if let Err(error) = renderer.render(
                         self.camera.view_projection(renderer.aspect_ratio()),
                         self.camera.position,
-                    )
-                {
-                    self.startup_error = Some(error);
-                    event_loop.exit();
+                    ) {
+                        self.startup_error = Some(error);
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}

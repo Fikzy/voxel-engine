@@ -6,7 +6,7 @@ use glam::Mat4;
 use wgpu::{CurrentSurfaceTexture, util::DeviceExt};
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::world::Chunk;
+use crate::world::{CHUNK_EDGE, ChunkCoord, World};
 
 const RAYCAST_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -17,6 +17,8 @@ struct CameraUniform {
     inverse_view_projection: [[f32; 4]; 4],
     camera_position: [f32; 4],
     viewport: [f32; 4],
+    chunk_origin: [i32; 4],
+    chunk_grid: [u32; 4],
 }
 
 #[repr(C)]
@@ -55,10 +57,13 @@ pub struct Renderer {
     composite_bind_group: wgpu::BindGroup,
     debug_vertex_buffer: wgpu::Buffer,
     debug_vertex_count: u32,
+    stream_origin: ChunkCoord,
+    stream_dimensions: [u32; 3],
+    debug_visualization: bool,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Result<Self> {
+    pub async fn new(window: Arc<Window>, world: &World) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
@@ -82,10 +87,12 @@ impl Renderer {
             .context("surface does not support a presentation configuration")?;
         surface.configure(&device, &config);
 
-        let chunk = create_test_chunk();
-        let voxel_data: Vec<u32> = chunk.voxels().iter().map(|&voxel| voxel as u32).collect();
+        let (stream_origin, stream_dimensions) = world
+            .stream_bounds()
+            .context("world must have streamed chunks before renderer initialization")?;
+        let voxel_data = build_voxel_data(world, stream_origin, stream_dimensions);
         let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Test chunk voxels"),
+            label: Some("Streamed world voxels"),
             contents: bytemuck::cast_slice(&voxel_data),
             usage: wgpu::BufferUsages::STORAGE,
         });
@@ -272,7 +279,7 @@ impl Renderer {
                 },
             ],
         });
-        let debug_vertices = create_chunk_boundary_vertices();
+        let debug_vertices = create_chunk_boundary_vertices(stream_origin, stream_dimensions);
         let debug_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Chunk boundary debug vertices"),
             contents: bytemuck::cast_slice(&debug_vertices),
@@ -295,11 +302,84 @@ impl Renderer {
             composite_bind_group,
             debug_vertex_buffer,
             debug_vertex_count: debug_vertices.len() as u32,
+            stream_origin,
+            stream_dimensions,
+            debug_visualization: false,
         })
     }
 
     pub fn aspect_ratio(&self) -> f32 {
         self.config.width as f32 / self.config.height as f32
+    }
+
+    pub fn set_debug_visualization(&mut self, enabled: bool) {
+        self.debug_visualization = enabled;
+    }
+
+    pub fn update_world(&mut self, world: &World) {
+        let Some((origin, dimensions)) = world.stream_bounds() else {
+            return;
+        };
+        if origin == self.stream_origin && dimensions == self.stream_dimensions {
+            return;
+        }
+
+        let voxel_data = build_voxel_data(world, origin, dimensions);
+        self.voxel_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Streamed world voxels"),
+                contents: bytemuck::cast_slice(&voxel_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let (raycast_layout, mesh_layout) = (
+            self.raycast_pipeline.get_bind_group_layout(0),
+            self.composite_pipeline.get_bind_group_layout(0),
+        );
+        let raycast_view = self._raycast_view.clone();
+        self.raycast_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Streamed world raycast binding"),
+            layout: &raycast_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.voxel_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&raycast_view),
+                },
+            ],
+        });
+        self.composite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Streamed world composition binding"),
+            layout: &mesh_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&raycast_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let debug_vertices = create_chunk_boundary_vertices(origin, dimensions);
+        self.debug_vertex_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Streamed chunk boundary vertices"),
+                    contents: bytemuck::cast_slice(&debug_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+        self.debug_vertex_count = debug_vertices.len() as u32;
+        self.stream_origin = origin;
+        self.stream_dimensions = dimensions;
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -376,6 +456,18 @@ impl Renderer {
                     0.0,
                     0.0,
                 ],
+                chunk_origin: [
+                    self.stream_origin.x,
+                    self.stream_origin.y,
+                    self.stream_origin.z,
+                    0,
+                ],
+                chunk_grid: [
+                    self.stream_dimensions[0],
+                    self.stream_dimensions[1],
+                    self.stream_dimensions[2],
+                    CHUNK_EDGE as u32,
+                ],
             }),
         );
 
@@ -426,7 +518,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.composite_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        {
+        if self.debug_visualization{
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Chunk boundary debug mesh pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -478,17 +570,29 @@ fn create_raycast_output(
     (texture, view)
 }
 
-fn create_chunk_boundary_vertices() -> Vec<DebugVertex> {
-    let corners = [
-        [0.0, 0.0, 0.0],
-        [16.0, 0.0, 0.0],
-        [16.0, 16.0, 0.0],
-        [0.0, 16.0, 0.0],
-        [0.0, 0.0, 16.0],
-        [16.0, 0.0, 16.0],
-        [16.0, 16.0, 16.0],
-        [0.0, 16.0, 16.0],
-    ];
+fn build_voxel_data(world: &World, origin: ChunkCoord, dimensions: [u32; 3]) -> Vec<u32> {
+    let mut voxels =
+        Vec::with_capacity(dimensions.iter().product::<u32>() as usize * CHUNK_EDGE.pow(3));
+    for z in 0..dimensions[2] {
+        for y in 0..dimensions[1] {
+            for x in 0..dimensions[0] {
+                let coord = ChunkCoord {
+                    x: origin.x + x as i32,
+                    y: origin.y + y as i32,
+                    z: origin.z + z as i32,
+                };
+                if let Some(chunk) = world.chunk(coord) {
+                    voxels.extend(chunk.voxels().iter().map(|&material| material as u32));
+                } else {
+                    voxels.resize(voxels.len() + CHUNK_EDGE.pow(3), 0);
+                }
+            }
+        }
+    }
+    voxels
+}
+
+fn create_chunk_boundary_vertices(origin: ChunkCoord, dimensions: [u32; 3]) -> Vec<DebugVertex> {
     let edges = [
         (0, 1),
         (1, 2),
@@ -503,32 +607,36 @@ fn create_chunk_boundary_vertices() -> Vec<DebugVertex> {
         (2, 6),
         (3, 7),
     ];
-    edges
-        .into_iter()
-        .flat_map(|(start, end)| {
-            [start, end].map(|corner| DebugVertex {
-                position: corners[corner],
-                color: [0.25, 0.9, 0.95],
-            })
-        })
-        .collect()
-}
-
-fn create_test_chunk() -> Chunk {
-    let mut chunk = Chunk::new();
-    for (voxel, material) in [
-        ([6, 8, 5], 1),
-        ([7, 8, 5], 2),
-        ([8, 8, 5], 3),
-        ([9, 8, 5], 1),
-        ([8, 9, 5], 2),
-        ([8, 8, 6], 3),
-        ([15, 8, 4], 2),
-        ([0, 8, 4], 3),
-    ] {
-        chunk.set_voxel(voxel, material);
+    let mut vertices = Vec::new();
+    for z in 0..dimensions[2] {
+        for y in 0..dimensions[1] {
+            for x in 0..dimensions[0] {
+                let min = [
+                    (origin.x + x as i32) as f32 * CHUNK_EDGE as f32,
+                    (origin.y + y as i32) as f32 * CHUNK_EDGE as f32,
+                    (origin.z + z as i32) as f32 * CHUNK_EDGE as f32,
+                ];
+                let max = min.map(|axis| axis + CHUNK_EDGE as f32);
+                let corners = [
+                    [min[0], min[1], min[2]],
+                    [max[0], min[1], min[2]],
+                    [max[0], max[1], min[2]],
+                    [min[0], max[1], min[2]],
+                    [min[0], min[1], max[2]],
+                    [max[0], min[1], max[2]],
+                    [max[0], max[1], max[2]],
+                    [min[0], max[1], max[2]],
+                ];
+                vertices.extend(edges.into_iter().flat_map(|(start, end)| {
+                    [start, end].map(|corner| DebugVertex {
+                        position: corners[corner],
+                        color: [0.25, 0.9, 0.95],
+                    })
+                }));
+            }
+        }
     }
-    chunk
+    vertices
 }
 
 #[cfg(test)]
@@ -539,7 +647,8 @@ mod tests {
     use glam::Vec3;
     use wgpu::util::DeviceExt;
 
-    use super::{CameraUniform, RAYCAST_FORMAT, create_raycast_output, create_test_chunk};
+    use super::{CameraUniform, RAYCAST_FORMAT, build_voxel_data, create_raycast_output};
+    use crate::world::{CHUNK_EDGE, Chunk, ChunkCoord, World};
 
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
@@ -573,19 +682,64 @@ mod tests {
                 return;
             };
 
-            let chunk = create_test_chunk();
-            let voxels: Vec<u32> = chunk.voxels().iter().map(|&voxel| voxel as u32).collect();
+            let edge = CHUNK_EDGE as i32;
+            let middle = CHUNK_EDGE / 2;
+            let mut world = World::default();
+            world.stream_around(Vec3::splat(edge as f32), 1);
+            let mut first_chunk = Chunk::new();
+            first_chunk.set_voxel([middle, middle, middle], 1);
+            world.insert_chunk(ChunkCoord { x: 0, y: 1, z: 1 }, first_chunk);
+            let mut next_chunk = Chunk::new();
+            next_chunk.set_voxel([1.min(CHUNK_EDGE - 1), middle, middle], 2);
+            world.insert_chunk(ChunkCoord { x: 1, y: 1, z: 1 }, next_chunk);
+            let (stream_origin, stream_dimensions) = world.stream_bounds().unwrap();
+            let voxels = build_voxel_data(&world, stream_origin, stream_dimensions);
             let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("GPU traversal test voxels"),
                 contents: bytemuck::cast_slice(&voxels),
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let ray_cases = [
-                (Vec3::new(8.5, 8.5, 10.0), -Vec3::Z),
-                (Vec3::new(20.0, 8.5, 4.5), -Vec3::X),
-                (Vec3::new(15.5, 9.5, 4.5), Vec3::X),
-                (Vec3::new(-2.0, 8.5, 4.5), Vec3::X),
-                (Vec3::new(-2.0, 8.5, 4.5), -Vec3::X),
+                (
+                    Vec3::new(
+                        edge as f32 - 1.5,
+                        edge as f32 + middle as f32 + 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                    ),
+                    Vec3::X,
+                ),
+                (
+                    Vec3::new(
+                        edge as f32 + middle as f32 + 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                    ),
+                    -Vec3::X,
+                ),
+                (
+                    Vec3::new(
+                        stream_dimensions[0] as f32 * edge as f32 - 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                    ),
+                    Vec3::X,
+                ),
+                (
+                    Vec3::new(
+                        -2.0,
+                        edge as f32 + middle as f32 + 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                    ),
+                    Vec3::X,
+                ),
+                (
+                    Vec3::new(
+                        -2.0,
+                        edge as f32 + middle as f32 + 0.5,
+                        edge as f32 + middle as f32 + 0.5,
+                    ),
+                    -Vec3::X,
+                ),
             ];
             let probes: Vec<RayProbe> = ray_cases
                 .iter()
@@ -618,10 +772,20 @@ mod tests {
             });
             let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("GPU raycast test camera"),
-                contents: bytemuck::bytes_of(&CameraUniform::zeroed()),
+                contents: bytemuck::bytes_of(&CameraUniform {
+                    chunk_origin: [stream_origin.x, stream_origin.y, stream_origin.z, 0],
+                    chunk_grid: [
+                        stream_dimensions[0],
+                        stream_dimensions[1],
+                        stream_dimensions[2],
+                        CHUNK_EDGE as u32,
+                    ],
+                    ..CameraUniform::zeroed()
+                }),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-            let (output_texture, output_view) = create_raycast_output(&device, 16, 16);
+            let (output_texture, output_view) =
+                create_raycast_output(&device, CHUNK_EDGE as u32, CHUNK_EDGE as u32);
             let image_bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("GPU image raycast test bind group layout"),
@@ -793,10 +957,16 @@ mod tests {
             let voxel_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("GPU traversal test voxel binding"),
                 layout: &pipeline.get_bind_group_layout(0),
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: voxel_buffer.as_entire_binding(),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: voxel_buffer.as_entire_binding(),
+                    },
+                ],
             });
             let probe_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("GPU traversal test ray binding"),
@@ -846,7 +1016,7 @@ mod tests {
             for (index, ((origin, direction), gpu_hit)) in
                 ray_cases.iter().zip(gpu_results).enumerate()
             {
-                let cpu_hit = chunk.raycast(*origin, *direction, 128.0);
+                let cpu_hit = world.raycast(*origin, *direction, edge as f32 * 8.0);
                 let expected = cpu_hit.map_or([u32::MAX, u32::MAX, u32::MAX, 0], |hit| {
                     [
                         hit.voxel[0] as u32,

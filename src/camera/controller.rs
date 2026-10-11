@@ -11,7 +11,7 @@ use crate::camera::Camera;
 
 const MOUSE_SENSITIVITY: f32 = 0.002;
 const NORMAL_SPEED: f32 = 5.0;
-const FAST_SPEED: f32 = 15.0;
+const FAST_SPEED: f32 = 50.0;
 const MAX_PITCH: f32 = 1.5533;
 
 #[derive(Default)]
@@ -49,7 +49,11 @@ impl CameraController {
         camera.pitch =
             (camera.pitch - mouse_y as f32 * MOUSE_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
 
-        let forward = camera.forward();
+        // Cancel out up and down direction when moving forward/backward
+        let mut forward = camera.forward();
+        forward.y = 0.0;
+        forward = forward.normalize();
+
         let right = forward.cross(Vec3::Y).normalize();
         let mut movement = Vec3::ZERO;
         if self.pressed_keys.contains(&KeyCode::KeyW) {

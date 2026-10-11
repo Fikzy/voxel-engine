@@ -3,6 +3,8 @@ struct Camera {
     inverse_view_projection: mat4x4<f32>,
     camera_position: vec4<f32>,
     viewport: vec4<f32>,
+    chunk_origin: vec4<i32>,
+    chunk_grid: vec4<u32>,
 };
 
 @group(0) @binding(0)
@@ -35,18 +37,24 @@ struct TraceResult {
 
 fn trace_chunk(origin: vec3<f32>, ray_direction: vec3<f32>) -> TraceResult {
     let direction = normalize(ray_direction);
-    let edge = f32(16);
+    let edge = f32(camera.chunk_grid.w);
+    let grid_dimensions = vec3<i32>(camera.chunk_grid.xyz);
+    if edge < 1.0 || any(grid_dimensions < vec3<i32>(1)) {
+        return TraceResult(vec3<i32>(-1), 0u, vec3<f32>(0.0), 0.0, 0u);
+    }
+    let lower_bound = vec3<f32>(camera.chunk_origin.xyz) * edge;
+    let upper_bound = lower_bound + vec3<f32>(grid_dimensions) * edge;
     var entry = 0.0;
-    var exit = 128.0;
+    var exit = 1.0e30;
 
     for (var axis = 0; axis < 3; axis += 1) {
         if abs(direction[axis]) < 1.0e-7 {
-            if origin[axis] < 0.0 || origin[axis] >= edge {
+            if origin[axis] < lower_bound[axis] || origin[axis] >= upper_bound[axis] {
                 return TraceResult(vec3<i32>(-1), 0u, vec3<f32>(0.0), 0.0, 0u);
             }
         } else {
-            let first = (0.0 - origin[axis]) / direction[axis];
-            let second = (edge - origin[axis]) / direction[axis];
+            let first = (lower_bound[axis] - origin[axis]) / direction[axis];
+            let second = (upper_bound[axis] - origin[axis]) / direction[axis];
             entry = max(entry, min(first, second));
             exit = min(exit, max(first, second));
         }
@@ -72,15 +80,23 @@ fn trace_chunk(origin: vec3<f32>, ray_direction: vec3<f32>) -> TraceResult {
 
     var distance = max(entry, 0.0);
     var normal = vec3<f32>(0.0);
-    for (var iteration = 0; iteration < 48; iteration += 1) {
-        if distance > exit || distance > 128.0 {
+    let lower_voxel = vec3<i32>(lower_bound);
+    let upper_voxel = vec3<i32>(upper_bound);
+    loop {
+        if distance > exit {
             break;
         }
-        if any(voxel < vec3<i32>(0)) || any(voxel >= vec3<i32>(16)) {
+        if any(voxel < lower_voxel) || any(voxel >= upper_voxel) {
             return TraceResult(vec3<i32>(-1), 0u, vec3<f32>(0.0), 0.0, 0u);
         }
 
-        let index = u32(voxel.x + 16 * (voxel.y + 16 * voxel.z));
+        let offset = voxel - lower_voxel;
+        let chunk_coord = offset / i32(edge);
+        let local_voxel = offset % i32(edge);
+        let chunk_index = u32(chunk_coord.x + grid_dimensions.x * (chunk_coord.y + grid_dimensions.y * chunk_coord.z));
+        let chunk_volume = u32(edge * edge * edge);
+        let local_index = u32(local_voxel.x + i32(edge) * (local_voxel.y + i32(edge) * local_voxel.z));
+        let index = chunk_index * chunk_volume + local_index;
         let material = voxels[index];
         if material != 0u {
             return TraceResult(voxel, material, normal, distance, 1u);
@@ -110,9 +126,9 @@ fn shade_ray(origin: vec3<f32>, direction: vec3<f32>) -> vec4<f32> {
     }
 
     let palette = array<vec3<f32>, 3>(
-        vec3<f32>(0.88, 0.24, 0.16),
-        vec3<f32>(0.18, 0.72, 0.38),
-        vec3<f32>(0.20, 0.44, 0.92),
+        vec3<f32>(0.19, 0.47, 0.03), // grass / green
+        vec3<f32>(0.51, 0.36, 0.23), // dirt  / brown
+        vec3<f32>(0.59, 0.58, 0.55), // stone / grey
     );
     let material_color = palette[min(hit.material - 1u, 2u)];
     let light = 0.62 + 0.38 * max(dot(hit.normal, normalize(vec3<f32>(-0.4, 0.8, 0.5))), 0.0);

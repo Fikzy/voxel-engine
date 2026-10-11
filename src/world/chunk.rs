@@ -54,6 +54,34 @@ impl Chunk {
         }
     }
 
+    pub fn generate(coord: ChunkCoord) -> Self {
+        let mut chunk = Self::new();
+        let edge = CHUNK_EDGE as i32;
+
+        for z in 0..CHUNK_EDGE {
+            for x in 0..CHUNK_EDGE {
+                let world_x = coord.x * edge + x as i32;
+                let world_z = coord.z * edge + z as i32;
+                let surface_y = terrain_surface_height(world_x, world_z);
+
+                for y in 0..CHUNK_EDGE {
+                    let world_y = coord.y * edge + y as i32;
+                    if world_y <= surface_y {
+                        let material = if world_y == surface_y {
+                            1
+                        } else if world_y >= surface_y - 3 {
+                            2
+                        } else {
+                            3
+                        };
+                        chunk.set_voxel([x, y, z], material);
+                    }
+                }
+            }
+        }
+        chunk
+    }
+
     pub fn voxel(&self, local: [usize; 3]) -> Option<u8> {
         Self::index(local).map(|index| self.voxels[index])
     }
@@ -157,68 +185,122 @@ impl Chunk {
     }
 }
 
+pub(super) fn terrain_surface_height(world_x: i32, world_z: i32) -> i32 {
+    let edge = CHUNK_EDGE as i32;
+    let base_height = edge / 2;
+    let variation = (edge / 8).max(1);
+    let hash = world_x.wrapping_mul(73_856_093) ^ world_z.wrapping_mul(19_349_663);
+    base_height + hash.rem_euclid(variation * 2 + 1) - variation
+}
+
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
 
-    use super::{CHUNK_EDGE, Chunk, ChunkCoord};
+    use super::{CHUNK_EDGE, Chunk, ChunkCoord, terrain_surface_height};
 
     #[test]
     fn maps_negative_voxels_to_euclidean_chunk_coordinates() {
+        let edge = CHUNK_EDGE as i32;
         assert_eq!(
-            ChunkCoord::from_voxel(-1, -16, -17),
+            ChunkCoord::from_voxel(-1, -edge, -edge - 1),
             ChunkCoord {
                 x: -1,
                 y: -1,
                 z: -2
             }
         );
-        assert_eq!(ChunkCoord::local_voxel(-1, -16, -17), [15, 0, 15]);
+        assert_eq!(
+            ChunkCoord::local_voxel(-1, -edge, -edge - 1),
+            [CHUNK_EDGE - 1, 0, CHUNK_EDGE - 1]
+        );
     }
 
     #[test]
     fn stores_materials_at_valid_local_coordinates() {
         let mut chunk = Chunk::new();
-        assert!(chunk.set_voxel([CHUNK_EDGE - 1, 2, 3], 7));
-        assert_eq!(chunk.voxel([CHUNK_EDGE - 1, 2, 3]), Some(7));
-        assert_eq!(chunk.voxel([CHUNK_EDGE, 2, 3]), None);
+        let valid = [CHUNK_EDGE - 1, CHUNK_EDGE / 2, CHUNK_EDGE / 2];
+        assert!(chunk.set_voxel(valid, 7));
+        assert_eq!(chunk.voxel(valid), Some(7));
+        assert_eq!(chunk.voxel([CHUNK_EDGE, 0, 0]), None);
         assert!(!chunk.set_voxel([0, 0, CHUNK_EDGE], 1));
     }
 
     #[test]
     fn raycast_hits_known_voxels_and_respects_chunk_edges() {
+        let edge = CHUNK_EDGE as f32;
+        let middle = CHUNK_EDGE / 2;
+        let depth = CHUNK_EDGE / 4;
         let mut chunk = Chunk::new();
-        chunk.set_voxel([8, 8, 4], 1);
-        chunk.set_voxel([15, 8, 4], 2);
-        chunk.set_voxel([0, 8, 4], 3);
+        if CHUNK_EDGE < 3 {
+            chunk.set_voxel([0, 0, 0], 1);
+            let hit = chunk
+                .raycast(Vec3::new(-1.0, 0.5, 0.5), Vec3::X, edge * 2.0)
+                .unwrap();
+            assert_eq!(hit.voxel, [0, 0, 0]);
+            assert_eq!(hit.material, 1);
+            return;
+        }
+        chunk.set_voxel([middle, middle, depth], 1);
+        chunk.set_voxel([CHUNK_EDGE - 1, middle, depth], 2);
+        chunk.set_voxel([0, middle, depth], 3);
 
         let center_hit = chunk
-            .raycast(Vec3::new(8.5, 8.5, 10.0), -Vec3::Z, 20.0)
+            .raycast(
+                Vec3::new(middle as f32 + 0.5, middle as f32 + 0.5, edge + 1.0),
+                -Vec3::Z,
+                edge * 2.0,
+            )
             .unwrap();
-        assert_eq!(center_hit.voxel, [8, 8, 4]);
+        assert_eq!(center_hit.voxel, [middle, middle, depth]);
         assert_eq!(center_hit.material, 1);
 
         let edge_hit = chunk
-            .raycast(Vec3::new(20.0, 8.5, 4.5), -Vec3::X, 20.0)
+            .raycast(
+                Vec3::new(edge + 4.0, middle as f32 + 0.5, depth as f32 + 0.5),
+                -Vec3::X,
+                edge * 2.0,
+            )
             .unwrap();
-        assert_eq!(edge_hit.voxel, [15, 8, 4]);
+        assert_eq!(edge_hit.voxel, [CHUNK_EDGE - 1, middle, depth]);
         assert_eq!(edge_hit.material, 2);
 
         assert!(
             chunk
-                .raycast(Vec3::new(15.5, 9.5, 4.5), Vec3::X, 20.0)
+                .raycast(Vec3::new(edge - 0.5, 0.5, 0.5), Vec3::X, edge * 2.0,)
                 .is_none()
         );
         assert!(
             chunk
-                .raycast(Vec3::new(-2.0, 8.5, 4.5), -Vec3::X, 20.0)
+                .raycast(
+                    Vec3::new(-2.0, middle as f32 + 0.5, depth as f32 + 0.5),
+                    -Vec3::X,
+                    edge * 2.0,
+                )
                 .is_none()
         );
 
         let entry_hit = chunk
-            .raycast(Vec3::new(-2.0, 8.5, 4.5), Vec3::X, 20.0)
+            .raycast(
+                Vec3::new(-2.0, middle as f32 + 0.5, depth as f32 + 0.5),
+                Vec3::X,
+                edge * 2.0,
+            )
             .unwrap();
-        assert_eq!(entry_hit.voxel, [0, 8, 4]);
+        assert_eq!(entry_hit.voxel, [0, middle, depth]);
         assert_eq!(entry_hit.material, 3);
+    }
+
+    #[test]
+    fn terrain_height_is_deterministic_and_varies_per_column() {
+        let heights: Vec<_> = (0..CHUNK_EDGE as i32)
+            .map(|x| terrain_surface_height(x, 0))
+            .collect();
+        let repeated: Vec<_> = (0..CHUNK_EDGE as i32)
+            .map(|x| terrain_surface_height(x, 0))
+            .collect();
+
+        assert_eq!(heights, repeated);
+        assert!(heights.windows(2).any(|pair| pair[0] != pair[1]));
     }
 }
