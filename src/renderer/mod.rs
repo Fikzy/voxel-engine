@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -6,7 +7,7 @@ use glam::Mat4;
 use wgpu::{CurrentSurfaceTexture, util::DeviceExt};
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::world::{CHUNK_EDGE, ChunkCoord, World};
+use crate::world::{CHUNK_EDGE, Chunk, ChunkCoord, World, WorldChunkChanges};
 
 const RAYCAST_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -49,7 +50,10 @@ pub struct Renderer {
     raycast_pipeline: wgpu::ComputePipeline,
     composite_pipeline: wgpu::RenderPipeline,
     debug_pipeline: wgpu::RenderPipeline,
-    voxel_buffer: wgpu::Buffer,
+    _voxel_atlas: wgpu::Texture,
+    voxel_view: wgpu::TextureView,
+    chunk_residency_buffer: wgpu::Buffer,
+    uploaded_chunk_coords: HashSet<ChunkCoord>,
     _raycast_texture: wgpu::Texture,
     _raycast_view: wgpu::TextureView,
     camera_buffer: wgpu::Buffer,
@@ -90,12 +94,8 @@ impl Renderer {
         let (stream_origin, stream_dimensions) = world
             .stream_bounds()
             .context("world must have streamed chunks before renderer initialization")?;
-        let voxel_data = build_voxel_data(world, stream_origin, stream_dimensions);
-        let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Streamed world voxels"),
-            contents: bytemuck::cast_slice(&voxel_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let (voxel_atlas, voxel_view, chunk_residency_buffer, uploaded_chunk_coords) =
+            create_voxel_atlas(&device, &queue, world, stream_origin, stream_dimensions);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera uniform buffer"),
             contents: bytemuck::bytes_of(&CameraUniform::zeroed()),
@@ -118,6 +118,16 @@ impl Renderer {
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
@@ -126,7 +136,7 @@ impl Renderer {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2,
+                        binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
@@ -257,10 +267,14 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: voxel_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&voxel_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: chunk_residency_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::TextureView(&raycast_view),
                 },
             ],
@@ -279,11 +293,11 @@ impl Renderer {
                 },
             ],
         });
-        let debug_vertices = create_chunk_boundary_vertices(stream_origin, stream_dimensions);
-        let debug_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Chunk boundary debug vertices"),
-            contents: bytemuck::cast_slice(&debug_vertices),
+        let debug_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hidden chunk boundary debug vertices"),
+            size: 4,
             usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
         });
 
         Ok(Self {
@@ -294,14 +308,17 @@ impl Renderer {
             raycast_pipeline,
             composite_pipeline,
             debug_pipeline,
-            voxel_buffer,
+            _voxel_atlas: voxel_atlas,
+            voxel_view,
+            chunk_residency_buffer,
+            uploaded_chunk_coords,
             _raycast_texture: raycast_texture,
             _raycast_view: raycast_view,
             camera_buffer,
             raycast_bind_group,
             composite_bind_group,
             debug_vertex_buffer,
-            debug_vertex_count: debug_vertices.len() as u32,
+            debug_vertex_count: 0,
             stream_origin,
             stream_dimensions,
             debug_visualization: false,
@@ -314,62 +331,66 @@ impl Renderer {
 
     pub fn set_debug_visualization(&mut self, enabled: bool) {
         self.debug_visualization = enabled;
+        if enabled {
+            self.rebuild_debug_mesh();
+        } else {
+            self.debug_vertex_count = 0;
+        }
     }
 
-    pub fn update_world(&mut self, world: &World) {
+    pub fn update_world(&mut self, world: &World, changes: WorldChunkChanges) {
         let Some((origin, dimensions)) = world.stream_bounds() else {
             return;
         };
-        if origin == self.stream_origin && dimensions == self.stream_dimensions {
-            return;
+        if dimensions != self.stream_dimensions {
+            let (atlas, view, residency, uploaded) =
+                create_voxel_atlas(&self.device, &self.queue, world, origin, dimensions);
+            let layout = self.raycast_pipeline.get_bind_group_layout(0);
+            self.raycast_bind_group = create_raycast_bind_group(
+                &self.device,
+                &layout,
+                &self.camera_buffer,
+                &view,
+                &residency,
+                &self._raycast_view,
+            );
+            self._voxel_atlas = atlas;
+            self.voxel_view = view;
+            self.chunk_residency_buffer = residency;
+            self.uploaded_chunk_coords = uploaded;
+        } else {
+            for coord in changes.unloaded {
+                self.uploaded_chunk_coords.remove(&coord);
+                if let Some(index) = residency_index(coord, dimensions) {
+                    write_residency(&self.queue, &self.chunk_residency_buffer, index, false);
+                }
+            }
+
+            for coord in changes.loaded {
+                if self.uploaded_chunk_coords.contains(&coord) {
+                    continue;
+                }
+                let Some(chunk) = world.chunk(coord) else {
+                    continue;
+                };
+                upload_chunk_region(&self.queue, &self._voxel_atlas, chunk, coord, dimensions);
+                if let Some(index) = residency_index(coord, dimensions) {
+                    write_residency(&self.queue, &self.chunk_residency_buffer, index, true);
+                    self.uploaded_chunk_coords.insert(coord);
+                }
+            }
         }
 
-        let voxel_data = build_voxel_data(world, origin, dimensions);
-        self.voxel_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Streamed world voxels"),
-                contents: bytemuck::cast_slice(&voxel_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let (raycast_layout, mesh_layout) = (
-            self.raycast_pipeline.get_bind_group_layout(0),
-            self.composite_pipeline.get_bind_group_layout(0),
-        );
-        let raycast_view = self._raycast_view.clone();
-        self.raycast_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Streamed world raycast binding"),
-            layout: &raycast_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.voxel_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&raycast_view),
-                },
-            ],
-        });
-        self.composite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Streamed world composition binding"),
-            layout: &mesh_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&raycast_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        let debug_vertices = create_chunk_boundary_vertices(origin, dimensions);
+        self.stream_origin = origin;
+        self.stream_dimensions = dimensions;
+        if self.debug_visualization {
+            self.rebuild_debug_mesh();
+        }
+    }
+
+    fn rebuild_debug_mesh(&mut self) {
+        let debug_vertices =
+            create_chunk_boundary_vertices(self.stream_origin, self.stream_dimensions);
         self.debug_vertex_buffer =
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -378,8 +399,6 @@ impl Renderer {
                     usage: wgpu::BufferUsages::VERTEX,
                 });
         self.debug_vertex_count = debug_vertices.len() as u32;
-        self.stream_origin = origin;
-        self.stream_dimensions = dimensions;
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -401,10 +420,14 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.voxel_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.voxel_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: self.chunk_residency_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::TextureView(&view),
                 },
             ],
@@ -518,7 +541,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.composite_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        if self.debug_visualization{
+        if self.debug_visualization {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Chunk boundary debug mesh pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -570,26 +593,141 @@ fn create_raycast_output(
     (texture, view)
 }
 
-fn build_voxel_data(world: &World, origin: ChunkCoord, dimensions: [u32; 3]) -> Vec<u32> {
-    let mut voxels =
-        Vec::with_capacity(dimensions.iter().product::<u32>() as usize * CHUNK_EDGE.pow(3));
-    for z in 0..dimensions[2] {
-        for y in 0..dimensions[1] {
-            for x in 0..dimensions[0] {
-                let coord = ChunkCoord {
-                    x: origin.x + x as i32,
-                    y: origin.y + y as i32,
-                    z: origin.z + z as i32,
-                };
-                if let Some(chunk) = world.chunk(coord) {
-                    voxels.extend(chunk.voxels().iter().map(|&material| material as u32));
-                } else {
-                    voxels.resize(voxels.len() + CHUNK_EDGE.pow(3), 0);
-                }
-            }
+fn create_raycast_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buffer: &wgpu::Buffer,
+    voxel_view: &wgpu::TextureView,
+    residency_buffer: &wgpu::Buffer,
+    output_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Streamed world raycast binding"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(voxel_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: residency_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+        ],
+    })
+}
+
+fn create_voxel_atlas(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    world: &World,
+    _origin: ChunkCoord,
+    dimensions: [u32; 3],
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Buffer,
+    HashSet<ChunkCoord>,
+) {
+    let edge = CHUNK_EDGE as u32;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Streamed chunk voxel atlas"),
+        size: wgpu::Extent3d {
+            width: dimensions[0] * edge,
+            height: dimensions[1] * edge,
+            depth_or_array_layers: dimensions[2] * edge,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut residency = vec![0_u32; dimensions.iter().product::<u32>() as usize];
+    let mut uploaded = HashSet::new();
+    for (coord, chunk) in world.streamed_chunks() {
+        if let Some(index) = residency_index(coord, dimensions) {
+            upload_chunk_region(queue, &texture, chunk, coord, dimensions);
+            residency[index] = 1;
+            uploaded.insert(coord);
         }
     }
-    voxels
+    let residency_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Streamed chunk residency table"),
+        contents: bytemuck::cast_slice(&residency),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    (texture, view, residency_buffer, uploaded)
+}
+
+fn residency_index(coord: ChunkCoord, dimensions: [u32; 3]) -> Option<usize> {
+    if dimensions.contains(&0) {
+        return None;
+    }
+    let x = coord.x.rem_euclid(dimensions[0] as i32) as usize;
+    let y = coord.y.rem_euclid(dimensions[1] as i32) as usize;
+    let z = coord.z.rem_euclid(dimensions[2] as i32) as usize;
+    Some(x + dimensions[0] as usize * (y + dimensions[1] as usize * z))
+}
+
+fn write_residency(queue: &wgpu::Queue, buffer: &wgpu::Buffer, index: usize, loaded: bool) {
+    let value = u32::from(loaded);
+    queue.write_buffer(
+        buffer,
+        (index * std::mem::size_of::<u32>()) as u64,
+        bytemuck::bytes_of(&value),
+    );
+}
+
+fn upload_chunk_region(
+    queue: &wgpu::Queue,
+    atlas: &wgpu::Texture,
+    chunk: &Chunk,
+    coord: ChunkCoord,
+    dimensions: [u32; 3],
+) {
+    let edge = CHUNK_EDGE as u32;
+    let slot_x = coord.x.rem_euclid(dimensions[0] as i32) as u32;
+    let slot_y = coord.y.rem_euclid(dimensions[1] as i32) as u32;
+    let slot_z = coord.z.rem_euclid(dimensions[2] as i32) as u32;
+    let voxels: Vec<u32> = chunk
+        .voxels()
+        .iter()
+        .map(|&material| material as u32)
+        .collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: atlas,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: slot_x * edge,
+                y: slot_y * edge,
+                z: slot_z * edge,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&voxels),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(edge * std::mem::size_of::<u32>() as u32),
+            rows_per_image: Some(edge),
+        },
+        wgpu::Extent3d {
+            width: edge,
+            height: edge,
+            depth_or_array_layers: edge,
+        },
+    );
 }
 
 fn create_chunk_boundary_vertices(origin: ChunkCoord, dimensions: [u32; 3]) -> Vec<DebugVertex> {
@@ -647,7 +785,9 @@ mod tests {
     use glam::Vec3;
     use wgpu::util::DeviceExt;
 
-    use super::{CameraUniform, RAYCAST_FORMAT, build_voxel_data, create_raycast_output};
+    use super::{
+        CameraUniform, RAYCAST_FORMAT, create_raycast_output, create_voxel_atlas, residency_index,
+    };
     use crate::world::{CHUNK_EDGE, Chunk, ChunkCoord, World};
 
     #[repr(C)]
@@ -655,6 +795,21 @@ mod tests {
     struct RayProbe {
         origin: [f32; 4],
         direction: [f32; 4],
+    }
+
+    #[test]
+    fn atlas_slots_are_stable_as_the_stream_origin_moves() {
+        let dimensions = [11, 11, 11];
+        let resident = ChunkCoord { x: -3, y: 4, z: 8 };
+        let after_window_shift = ChunkCoord { x: 8, y: 15, z: 19 };
+        assert_eq!(
+            residency_index(resident, dimensions),
+            residency_index(after_window_shift, dimensions)
+        );
+        assert_ne!(
+            residency_index(resident, dimensions),
+            residency_index(ChunkCoord { x: -2, y: 4, z: 8 }, dimensions)
+        );
     }
 
     #[test]
@@ -693,12 +848,8 @@ mod tests {
             next_chunk.set_voxel([1.min(CHUNK_EDGE - 1), middle, middle], 2);
             world.insert_chunk(ChunkCoord { x: 1, y: 1, z: 1 }, next_chunk);
             let (stream_origin, stream_dimensions) = world.stream_bounds().unwrap();
-            let voxels = build_voxel_data(&world, stream_origin, stream_dimensions);
-            let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("GPU traversal test voxels"),
-                contents: bytemuck::cast_slice(&voxels),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+            let (_voxel_atlas, voxel_view, chunk_residency_buffer, _uploaded_chunks) =
+                create_voxel_atlas(&device, &queue, &world, stream_origin, stream_dimensions);
             let ray_cases = [
                 (
                     Vec3::new(
@@ -803,6 +954,16 @@ mod tests {
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Uint,
+                                view_dimension: wgpu::TextureViewDimension::D3,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Storage { read_only: true },
                                 has_dynamic_offset: false,
@@ -811,7 +972,7 @@ mod tests {
                             count: None,
                         },
                         wgpu::BindGroupLayoutEntry {
-                            binding: 2,
+                            binding: 3,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::StorageTexture {
                                 access: wgpu::StorageTextureAccess::WriteOnly,
@@ -847,10 +1008,14 @@ mod tests {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: voxel_buffer.as_entire_binding(),
+                        resource: wgpu::BindingResource::TextureView(&voxel_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: chunk_residency_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: wgpu::BindingResource::TextureView(&output_view),
                     },
                 ],
@@ -964,7 +1129,11 @@ mod tests {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: voxel_buffer.as_entire_binding(),
+                        resource: wgpu::BindingResource::TextureView(&voxel_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: chunk_residency_buffer.as_entire_binding(),
                     },
                 ],
             });

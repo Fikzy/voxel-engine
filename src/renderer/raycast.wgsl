@@ -11,9 +11,12 @@ struct Camera {
 var<uniform> camera: Camera;
 
 @group(0) @binding(1)
-var<storage, read> voxels: array<u32>;
+var voxel_atlas: texture_3d<u32>;
 
 @group(0) @binding(2)
+var<storage, read> chunk_residency: array<u32>;
+
+@group(0) @binding(3)
 var output_image: texture_storage_2d<rgba8unorm, write>;
 
 struct RayProbe {
@@ -91,13 +94,19 @@ fn trace_chunk(origin: vec3<f32>, ray_direction: vec3<f32>) -> TraceResult {
         }
 
         let offset = voxel - lower_voxel;
-        let chunk_coord = offset / i32(edge);
-        let local_voxel = offset % i32(edge);
-        let chunk_index = u32(chunk_coord.x + grid_dimensions.x * (chunk_coord.y + grid_dimensions.y * chunk_coord.z));
-        let chunk_volume = u32(edge * edge * edge);
-        let local_index = u32(local_voxel.x + i32(edge) * (local_voxel.y + i32(edge) * local_voxel.z));
-        let index = chunk_index * chunk_volume + local_index;
-        let material = voxels[index];
+        let relative_chunk = offset / i32(edge);
+        let world_chunk = camera.chunk_origin.xyz + relative_chunk;
+        let slot = vec3<i32>(
+            ((world_chunk.x % grid_dimensions.x) + grid_dimensions.x) % grid_dimensions.x,
+            ((world_chunk.y % grid_dimensions.y) + grid_dimensions.y) % grid_dimensions.y,
+            ((world_chunk.z % grid_dimensions.z) + grid_dimensions.z) % grid_dimensions.z,
+        );
+        let chunk_index = u32(slot.x + grid_dimensions.x * (slot.y + grid_dimensions.y * slot.z));
+        var material = 0u;
+        if chunk_residency[chunk_index] != 0u {
+            let local_voxel = offset % i32(edge);
+            material = textureLoad(voxel_atlas, slot * i32(edge) + local_voxel, 0).r;
+        }
         if material != 0u {
             return TraceResult(voxel, material, normal, distance, 1u);
         }

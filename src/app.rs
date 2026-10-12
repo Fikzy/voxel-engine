@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use winit::{
@@ -26,6 +26,13 @@ struct App {
     debug_visualization: bool,
     last_frame: Instant,
     mouse_look_active: bool,
+    timing_started: Instant,
+    timing_frames: u32,
+    stream_time: Duration,
+    stream_time_max: Duration,
+    sync_time: Duration,
+    sync_time_max: Duration,
+    render_time: Duration,
 }
 
 impl Default for App {
@@ -40,11 +47,60 @@ impl Default for App {
             debug_visualization: false,
             last_frame: Instant::now(),
             mouse_look_active: false,
+            timing_started: Instant::now(),
+            timing_frames: 0,
+            stream_time: Duration::ZERO,
+            stream_time_max: Duration::ZERO,
+            sync_time: Duration::ZERO,
+            sync_time_max: Duration::ZERO,
+            render_time: Duration::ZERO,
         }
     }
 }
 
 impl App {
+    fn report_frame_timings(
+        &mut self,
+        stream_time: Duration,
+        sync_time: Duration,
+        render_time: Duration,
+    ) {
+        self.timing_frames += 1;
+        self.stream_time += stream_time;
+        self.stream_time_max = self.stream_time_max.max(stream_time);
+        self.sync_time += sync_time;
+        self.sync_time_max = self.sync_time_max.max(sync_time);
+        self.render_time += render_time;
+
+        let elapsed = self.timing_started.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+
+        let frames = self.timing_frames.max(1) as f64;
+        let (generated_chunks, generation_time) = self.world.take_generation_timings();
+        eprintln!(
+            "[perf] fps={:.1} stream_poll_cpu_ms(avg/max)={:.3}/{:.3} chunk_sync_cpu_ms(avg/max)={:.3}/{:.3} render_submit_cpu_ms(avg)={:.3} generated={}/{}ms pending={} loaded={}",
+            frames / elapsed.as_secs_f64(),
+            self.stream_time.as_secs_f64() * 1000.0 / frames,
+            self.stream_time_max.as_secs_f64() * 1000.0,
+            self.sync_time.as_secs_f64() * 1000.0 / frames,
+            self.sync_time_max.as_secs_f64() * 1000.0,
+            self.render_time.as_secs_f64() * 1000.0 / frames,
+            generated_chunks,
+            generation_time.as_secs_f64() * 1000.0,
+            self.world.pending_chunk_count(),
+            self.world.loaded_chunk_count(),
+        );
+        self.timing_started = Instant::now();
+        self.timing_frames = 0;
+        self.stream_time = Duration::ZERO;
+        self.stream_time_max = Duration::ZERO;
+        self.sync_time = Duration::ZERO;
+        self.sync_time_max = Duration::ZERO;
+        self.render_time = Duration::ZERO;
+    }
+
     fn set_mouse_look(&mut self, active: bool) {
         let Some(window) = &self.window else {
             return;
@@ -169,13 +225,21 @@ impl ApplicationHandler for App {
                 self.camera_controller
                     .update(&mut self.camera, now - self.last_frame);
                 self.last_frame = now;
+                let stream_started = Instant::now();
                 let world_changed = self
                     .world
                     .stream_around(self.camera.position, STREAM_RADIUS);
+                let stream_time = stream_started.elapsed();
+                let mut sync_time = Duration::ZERO;
+                let mut render_time = Duration::ZERO;
                 if let Some(renderer) = &mut self.renderer {
                     if world_changed {
-                        renderer.update_world(&self.world);
+                        let changes = self.world.take_chunk_changes();
+                        let sync_started = Instant::now();
+                        renderer.update_world(&self.world, changes);
+                        sync_time = sync_started.elapsed();
                     }
+                    let render_started = Instant::now();
                     if let Err(error) = renderer.render(
                         self.camera.view_projection(renderer.aspect_ratio()),
                         self.camera.position,
@@ -183,7 +247,9 @@ impl ApplicationHandler for App {
                         self.startup_error = Some(error);
                         event_loop.exit();
                     }
+                    render_time = render_started.elapsed();
                 }
+                self.report_frame_timings(stream_time, sync_time, render_time);
             }
             _ => {}
         }

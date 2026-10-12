@@ -3,10 +3,14 @@ mod chunk;
 pub use chunk::{CHUNK_EDGE, Chunk, ChunkCoord, RayHit};
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use glam::Vec3;
 
-pub const STREAM_RADIUS: i32 = 2;
+pub const STREAM_RADIUS: i32 = 5;
+const MAX_CHUNKS_INTEGRATED_PER_FRAME: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldRayHit {
@@ -16,10 +20,105 @@ pub struct WorldRayHit {
     pub distance: f32,
 }
 
+#[derive(Default)]
+pub struct WorldChunkChanges {
+    pub loaded: Vec<ChunkCoord>,
+    pub unloaded: Vec<ChunkCoord>,
+}
+
 pub struct World {
     chunks: HashMap<ChunkCoord, Chunk>,
     stream_origin: Option<ChunkCoord>,
     stream_dimensions: [u32; 3],
+    generation_epoch: u64,
+    pending_generation: HashSet<ChunkCoord>,
+    chunk_changes: WorldChunkChanges,
+    generated_chunks_since_report: u32,
+    generation_time_since_report: Duration,
+    generator: ChunkGenerator,
+}
+
+enum GenerationRequest {
+    Generate { epoch: u64, chunks: Vec<ChunkCoord> },
+    Shutdown,
+}
+
+struct GeneratedChunk {
+    epoch: u64,
+    coord: ChunkCoord,
+    chunk: Chunk,
+    generation_time: Duration,
+}
+
+struct ChunkGenerator {
+    requests: Sender<GenerationRequest>,
+    results: Receiver<GeneratedChunk>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ChunkGenerator {
+    fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("voxel-chunk-generator".into())
+            .spawn(move || {
+                let mut request = request_rx.recv();
+                'worker: loop {
+                    let GenerationRequest::Generate { epoch, chunks } = (match request {
+                        Ok(request) => request,
+                        Err(_) => break,
+                    }) else {
+                        break;
+                    };
+
+                    for coord in chunks {
+                        let start = Instant::now();
+                        let chunk = Chunk::generate(coord);
+                        let generated = GeneratedChunk {
+                            epoch,
+                            coord,
+                            chunk,
+                            generation_time: start.elapsed(),
+                        };
+                        if result_tx.send(generated).is_err() {
+                            break 'worker;
+                        }
+
+                        let mut latest_request = None;
+                        loop {
+                            match request_rx.try_recv() {
+                                Ok(GenerationRequest::Shutdown) => break 'worker,
+                                Ok(next_request) => latest_request = Some(next_request),
+                                Err(TryRecvError::Disconnected) => break 'worker,
+                                Err(TryRecvError::Empty) => break,
+                            }
+                        }
+                        if let Some(next_request) = latest_request {
+                            request = Ok(next_request);
+                            continue 'worker;
+                        }
+                    }
+                    request = request_rx.recv();
+                }
+            })
+            .expect("failed to start chunk generation worker");
+
+        Self {
+            requests: request_tx,
+            results: result_rx,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ChunkGenerator {
+    fn drop(&mut self) {
+        let _ = self.requests.send(GenerationRequest::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Default for World {
@@ -28,6 +127,12 @@ impl Default for World {
             chunks: HashMap::new(),
             stream_origin: None,
             stream_dimensions: [0; 3],
+            generation_epoch: 0,
+            pending_generation: HashSet::new(),
+            chunk_changes: WorldChunkChanges::default(),
+            generated_chunks_since_report: 0,
+            generation_time_since_report: Duration::ZERO,
+            generator: ChunkGenerator::new(),
         }
     }
 }
@@ -46,30 +151,72 @@ impl World {
             y: center.y - radius,
             z: center.z - radius,
         };
-        let desired: HashSet<_> = (0..diameter)
-            .flat_map(|z| {
-                (0..diameter).flat_map(move |y| {
-                    (0..diameter).map(move |x| ChunkCoord {
-                        x: origin.x + x as i32,
-                        y: origin.y + y as i32,
-                        z: origin.z + z as i32,
-                    })
-                })
-            })
-            .collect();
-
-        let mut changed = self.chunks.len() != desired.len()
-            || desired.iter().any(|coord| !self.chunks.contains_key(coord));
-        self.chunks.retain(|coord, _| desired.contains(coord));
-        for coord in desired {
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.chunks.entry(coord) {
-                entry.insert(Chunk::generate(coord));
-                changed = true;
+        let bounds_changed =
+            self.stream_origin != Some(origin) || self.stream_dimensions != [diameter; 3];
+        let mut changed = bounds_changed;
+        if bounds_changed {
+            let unloaded: Vec<_> = self
+                .chunks
+                .keys()
+                .copied()
+                .filter(|&coord| !is_inside_stream(coord, origin, [diameter; 3]))
+                .collect();
+            for coord in unloaded {
+                self.chunks.remove(&coord);
+                self.chunk_changes.unloaded.push(coord);
             }
+            self.stream_origin = Some(origin);
+            self.stream_dimensions = [diameter; 3];
+            self.generation_epoch = self.generation_epoch.wrapping_add(1);
+
+            let mut missing = Vec::new();
+            for z in 0..diameter {
+                for y in 0..diameter {
+                    for x in 0..diameter {
+                        let coord = ChunkCoord {
+                            x: origin.x + x as i32,
+                            y: origin.y + y as i32,
+                            z: origin.z + z as i32,
+                        };
+                        if !self.chunks.contains_key(&coord) {
+                            missing.push(coord);
+                        }
+                    }
+                }
+            }
+            self.pending_generation = missing.iter().copied().collect();
+            missing.sort_by_key(|coord| {
+                let dx = i64::from(coord.x - center.x);
+                let dy = i64::from(coord.y - center.y);
+                let dz = i64::from(coord.z - center.z);
+                (dx * dx + dy * dy + dz * dz, coord.z, coord.y, coord.x)
+            });
+            let _ = self.generator.requests.send(GenerationRequest::Generate {
+                epoch: self.generation_epoch,
+                chunks: missing,
+            });
         }
 
-        self.stream_origin = Some(origin);
-        self.stream_dimensions = [diameter; 3];
+        let mut integrated = 0;
+        while integrated < MAX_CHUNKS_INTEGRATED_PER_FRAME {
+            let Ok(generated) = self.generator.results.try_recv() else {
+                break;
+            };
+            if generated.epoch == self.generation_epoch
+                && is_inside_stream(generated.coord, origin, [diameter; 3])
+            {
+                self.pending_generation.remove(&generated.coord);
+                let was_missing = !self.chunks.contains_key(&generated.coord);
+                if was_missing {
+                    self.chunks.insert(generated.coord, generated.chunk);
+                    self.chunk_changes.loaded.push(generated.coord);
+                    self.generated_chunks_since_report += 1;
+                    self.generation_time_since_report += generated.generation_time;
+                    integrated += 1;
+                    changed = true;
+                }
+            }
+        }
         changed
     }
 
@@ -84,6 +231,21 @@ impl World {
 
     pub fn streamed_chunks(&self) -> impl Iterator<Item = (ChunkCoord, &Chunk)> {
         self.chunks.iter().map(|(&coord, chunk)| (coord, chunk))
+    }
+
+    pub fn take_chunk_changes(&mut self) -> WorldChunkChanges {
+        std::mem::take(&mut self.chunk_changes)
+    }
+
+    pub fn pending_chunk_count(&self) -> usize {
+        self.pending_generation.len()
+    }
+
+    pub fn take_generation_timings(&mut self) -> (u32, Duration) {
+        (
+            std::mem::take(&mut self.generated_chunks_since_report),
+            std::mem::take(&mut self.generation_time_since_report),
+        )
     }
 
     pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<WorldRayHit> {
@@ -108,11 +270,22 @@ impl World {
     }
 
     pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: Chunk) -> Option<Chunk> {
-        self.chunks.insert(coord, chunk)
+        let previous = self.chunks.insert(coord, chunk);
+        self.pending_generation.remove(&coord);
+        if previous.is_none() {
+            self.chunk_changes.loaded.push(coord);
+        } else if !self.chunk_changes.loaded.contains(&coord) {
+            self.chunk_changes.loaded.push(coord);
+        }
+        previous
     }
 
     pub fn remove_chunk(&mut self, coord: ChunkCoord) -> Option<Chunk> {
-        self.chunks.remove(&coord)
+        let removed = self.chunks.remove(&coord);
+        if removed.is_some() {
+            self.chunk_changes.unloaded.push(coord);
+        }
+        removed
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
@@ -120,8 +293,18 @@ impl World {
     }
 }
 
+fn is_inside_stream(coord: ChunkCoord, origin: ChunkCoord, dimensions: [u32; 3]) -> bool {
+    let offset = [coord.x - origin.x, coord.y - origin.y, coord.z - origin.z];
+    offset
+        .iter()
+        .zip(dimensions)
+        .all(|(&axis, dimension)| axis >= 0 && axis < dimension as i32)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use glam::Vec3;
 
     use super::{CHUNK_EDGE, Chunk, ChunkCoord, STREAM_RADIUS, World};
@@ -130,6 +313,7 @@ mod tests {
     fn streaming_loads_and_unloads_a_chunk_size_aware_region() {
         let mut world = World::default();
         assert!(world.stream_around(Vec3::ZERO, 1));
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, 1, 27);
         assert_eq!(world.loaded_chunk_count(), 27);
         assert_eq!(
             world.stream_bounds(),
@@ -146,15 +330,34 @@ mod tests {
 
         let moved = Vec3::new((CHUNK_EDGE * 2) as f32, 0.0, 0.0);
         assert!(world.stream_around(moved, 1));
+        wait_for_loaded_chunks(&mut world, moved, 1, 27);
         assert_eq!(world.loaded_chunk_count(), 27);
         assert!(world.chunk(ChunkCoord { x: 1, y: 0, z: 0 }).is_some());
         assert!(world.chunk(ChunkCoord { x: -1, y: 0, z: 0 }).is_none());
     }
 
     #[test]
+    fn one_chunk_window_shift_emits_only_entering_and_leaving_chunks() {
+        let mut world = World::default();
+        let radius = 1;
+        world.stream_around(Vec3::ZERO, radius);
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 27);
+        let initial = world.take_chunk_changes();
+        assert_eq!(initial.loaded.len(), 27);
+
+        let moved = Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0);
+        world.stream_around(moved, radius);
+        wait_for_loaded_chunks(&mut world, moved, radius, 27);
+        let changes = world.take_chunk_changes();
+        assert_eq!(changes.unloaded.len(), 9);
+        assert_eq!(changes.loaded.len(), 9);
+    }
+
+    #[test]
     fn generated_surface_uses_global_coordinates_across_chunk_boundaries() {
         let mut world = World::default();
         world.stream_around(Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1);
+        wait_for_loaded_chunks(&mut world, Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1, 27);
         let edge = CHUNK_EDGE as i32;
         for z in 0..CHUNK_EDGE {
             let global_z = z as i32;
@@ -185,7 +388,32 @@ mod tests {
         let mut world = World::default();
         world.stream_around(Vec3::ZERO, STREAM_RADIUS);
         let diameter = (STREAM_RADIUS * 2 + 1) as usize;
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, STREAM_RADIUS, diameter.pow(3));
         assert_eq!(world.loaded_chunk_count(), diameter.pow(3));
+    }
+
+    #[test]
+    fn larger_stream_radius_generates_without_blocking_the_caller() {
+        let mut world = World::default();
+        let radius = 3;
+        world.stream_around(Vec3::ZERO, radius);
+        let diameter = (radius * 2 + 1) as usize;
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, diameter.pow(3));
+    }
+
+    #[test]
+    fn latest_stream_request_discards_stale_generation_results() {
+        let mut world = World::default();
+        world.stream_around(Vec3::ZERO, STREAM_RADIUS);
+        let latest_position = Vec3::new((CHUNK_EDGE * 8) as f32, 0.0, 0.0);
+        world.stream_around(latest_position, 1);
+
+        wait_for_loaded_chunks(&mut world, latest_position, 1, 27);
+        let (origin, dimensions) = world.stream_bounds().unwrap();
+        assert_eq!(dimensions, [3; 3]);
+        assert!(world.chunk(ChunkCoord { x: 7, y: 0, z: 0 }).is_some());
+        assert!(world.chunk(ChunkCoord { x: -2, y: 0, z: 0 }).is_none());
+        assert!(origin.x <= 7);
     }
 
     #[test]
@@ -221,5 +449,14 @@ mod tests {
             ]
         );
         assert_eq!(hit.material, 2);
+    }
+
+    fn wait_for_loaded_chunks(world: &mut World, position: Vec3, radius: i32, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while world.loaded_chunk_count() < expected && Instant::now() < deadline {
+            world.stream_around(position, radius);
+            std::thread::yield_now();
+        }
+        assert_eq!(world.loaded_chunk_count(), expected);
     }
 }
