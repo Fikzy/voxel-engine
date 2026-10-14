@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 
-pub const STREAM_RADIUS: i32 = 5;
+pub const STREAM_RADIUS: i32 = 8;
 const MAX_CHUNKS_INTEGRATED_PER_FRAME: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,7 +159,9 @@ impl World {
                 .chunks
                 .keys()
                 .copied()
-                .filter(|&coord| !is_inside_stream(coord, origin, [diameter; 3]))
+                .filter(|&coord| {
+                    !is_inside_stream(coord, origin, [diameter; 3], center, radius)
+                })
                 .collect();
             for coord in unloaded {
                 self.chunks.remove(&coord);
@@ -178,13 +180,16 @@ impl World {
                             y: origin.y + y as i32,
                             z: origin.z + z as i32,
                         };
-                        if !self.chunks.contains_key(&coord) {
+                        if is_inside_stream(coord, origin, [diameter; 3], center, radius)
+                            && !self.chunks.contains_key(&coord)
+                        {
                             missing.push(coord);
                         }
                     }
                 }
             }
             self.pending_generation = missing.iter().copied().collect();
+            // Sort chunks by distance from center to prioritize their loading
             missing.sort_by_key(|coord| {
                 let dx = i64::from(coord.x - center.x);
                 let dy = i64::from(coord.y - center.y);
@@ -203,7 +208,7 @@ impl World {
                 break;
             };
             if generated.epoch == self.generation_epoch
-                && is_inside_stream(generated.coord, origin, [diameter; 3])
+                && is_inside_stream(generated.coord, origin, [diameter; 3], center, radius)
             {
                 self.pending_generation.remove(&generated.coord);
                 let was_missing = !self.chunks.contains_key(&generated.coord);
@@ -293,12 +298,21 @@ impl World {
     }
 }
 
-fn is_inside_stream(coord: ChunkCoord, origin: ChunkCoord, dimensions: [u32; 3]) -> bool {
+fn is_inside_stream(
+    coord: ChunkCoord,
+    origin: ChunkCoord,
+    dimensions: [u32; 3],
+    center: ChunkCoord,
+    radius: i32,
+) -> bool {
     let offset = [coord.x - origin.x, coord.y - origin.y, coord.z - origin.z];
-    offset
+    let inside_bounds = offset
         .iter()
         .zip(dimensions)
-        .all(|(&axis, dimension)| axis >= 0 && axis < dimension as i32)
+        .all(|(&axis, dimension)| axis >= 0 && axis < dimension as i32);
+    let dx = i64::from(coord.x) - i64::from(center.x);
+    let dz = i64::from(coord.z) - i64::from(center.z);
+    inside_bounds && dx * dx + dz * dz <= i64::from(radius) * i64::from(radius)
 }
 
 #[cfg(test)]
@@ -313,8 +327,11 @@ mod tests {
     fn streaming_loads_and_unloads_a_chunk_size_aware_region() {
         let mut world = World::default();
         assert!(world.stream_around(Vec3::ZERO, 1));
-        wait_for_loaded_chunks(&mut world, Vec3::ZERO, 1, 27);
-        assert_eq!(world.loaded_chunk_count(), 27);
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, 1, 15);
+        assert_eq!(world.loaded_chunk_count(), 15);
+        assert!(world.chunk(ChunkCoord { x: 1, y: 0, z: 1 }).is_none());
+        assert!(world.chunk(ChunkCoord { x: 0, y: 1, z: 0 }).is_some());
+        assert!(world.chunk(ChunkCoord { x: 0, y: 2, z: 0 }).is_none());
         assert_eq!(
             world.stream_bounds(),
             Some((
@@ -330,8 +347,8 @@ mod tests {
 
         let moved = Vec3::new((CHUNK_EDGE * 2) as f32, 0.0, 0.0);
         assert!(world.stream_around(moved, 1));
-        wait_for_loaded_chunks(&mut world, moved, 1, 27);
-        assert_eq!(world.loaded_chunk_count(), 27);
+        wait_for_loaded_chunks(&mut world, moved, 1, 15);
+        assert_eq!(world.loaded_chunk_count(), 15);
         assert!(world.chunk(ChunkCoord { x: 1, y: 0, z: 0 }).is_some());
         assert!(world.chunk(ChunkCoord { x: -1, y: 0, z: 0 }).is_none());
     }
@@ -341,13 +358,13 @@ mod tests {
         let mut world = World::default();
         let radius = 1;
         world.stream_around(Vec3::ZERO, radius);
-        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 27);
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 15);
         let initial = world.take_chunk_changes();
-        assert_eq!(initial.loaded.len(), 27);
+        assert_eq!(initial.loaded.len(), 15);
 
         let moved = Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0);
         world.stream_around(moved, radius);
-        wait_for_loaded_chunks(&mut world, moved, radius, 27);
+        wait_for_loaded_chunks(&mut world, moved, radius, 15);
         let changes = world.take_chunk_changes();
         assert_eq!(changes.unloaded.len(), 9);
         assert_eq!(changes.loaded.len(), 9);
@@ -357,7 +374,7 @@ mod tests {
     fn generated_surface_uses_global_coordinates_across_chunk_boundaries() {
         let mut world = World::default();
         world.stream_around(Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1);
-        wait_for_loaded_chunks(&mut world, Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1, 27);
+        wait_for_loaded_chunks(&mut world, Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1, 15);
         let edge = CHUNK_EDGE as i32;
         for z in 0..CHUNK_EDGE {
             let global_z = z as i32;
@@ -387,9 +404,8 @@ mod tests {
     fn default_stream_radius_is_nonempty() {
         let mut world = World::default();
         world.stream_around(Vec3::ZERO, STREAM_RADIUS);
-        let diameter = (STREAM_RADIUS * 2 + 1) as usize;
-        wait_for_loaded_chunks(&mut world, Vec3::ZERO, STREAM_RADIUS, diameter.pow(3));
-        assert_eq!(world.loaded_chunk_count(), diameter.pow(3));
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, STREAM_RADIUS, 891);
+        assert_eq!(world.loaded_chunk_count(), 891);
     }
 
     #[test]
@@ -397,8 +413,7 @@ mod tests {
         let mut world = World::default();
         let radius = 3;
         world.stream_around(Vec3::ZERO, radius);
-        let diameter = (radius * 2 + 1) as usize;
-        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, diameter.pow(3));
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 203);
     }
 
     #[test]
@@ -408,7 +423,7 @@ mod tests {
         let latest_position = Vec3::new((CHUNK_EDGE * 8) as f32, 0.0, 0.0);
         world.stream_around(latest_position, 1);
 
-        wait_for_loaded_chunks(&mut world, latest_position, 1, 27);
+        wait_for_loaded_chunks(&mut world, latest_position, 1, 15);
         let (origin, dimensions) = world.stream_bounds().unwrap();
         assert_eq!(dimensions, [3; 3]);
         assert!(world.chunk(ChunkCoord { x: 7, y: 0, z: 0 }).is_some());
