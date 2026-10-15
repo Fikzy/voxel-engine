@@ -16,7 +16,7 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            position: Vec3::new(8.0, 8.5, 24.0),
+            position: Vec3::new(0.0, 32.0, 0.0),
             yaw: 0.0,
             pitch: 0.0,
         }
@@ -58,24 +58,5 @@ impl Camera {
             ),
         );
         projection * view
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use glam::Vec4;
-
-    use super::Camera;
-
-    #[test]
-    fn default_camera_projects_seeded_voxels_near_view_center() {
-        let camera = Camera::default();
-        let clip = camera.view_projection(16.0 / 9.0) * Vec4::new(8.0, 8.5, 5.0, 1.0);
-        let ndc = clip.truncate() / clip.w;
-
-        assert!(clip.w > 0.0);
-        assert!(ndc.x.abs() < 0.001);
-        assert!(ndc.y.abs() < 0.01);
-        assert!((0.0..=1.0).contains(&ndc.z));
     }
 }

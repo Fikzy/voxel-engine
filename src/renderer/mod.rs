@@ -839,7 +839,7 @@ mod tests {
 
             let edge = CHUNK_EDGE as i32;
             let middle = CHUNK_EDGE / 2;
-            let mut world = World::default();
+            let mut world = World::new(42);
             world.stream_around(Vec3::splat(edge as f32), 1);
             let mut first_chunk = Chunk::new();
             first_chunk.set_voxel([middle, middle, middle], 1);

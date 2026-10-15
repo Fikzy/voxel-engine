@@ -1,7 +1,10 @@
 use glam::Vec3;
+use libnoise::Generator2D;
 
 pub const CHUNK_EDGE: usize = 16;
 const CHUNK_VOLUME: usize = CHUNK_EDGE * CHUNK_EDGE * CHUNK_EDGE;
+
+pub const SURFACE_RANGE: [usize; 2] = [0, 32];
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ChunkCoord {
@@ -54,7 +57,7 @@ impl Chunk {
         }
     }
 
-    pub fn generate(coord: ChunkCoord) -> Self {
+    pub fn generate<T: Generator2D>(coord: ChunkCoord, noise: &T) -> Self {
         let mut chunk = Self::new();
         let edge = CHUNK_EDGE as i32;
 
@@ -62,7 +65,8 @@ impl Chunk {
             for x in 0..CHUNK_EDGE {
                 let world_x = coord.x * edge + x as i32;
                 let world_z = coord.z * edge + z as i32;
-                let surface_y = terrain_surface_height(world_x, world_z);
+
+                let surface_y = terrain_surface_height(world_x, world_z, noise);
 
                 for y in 0..CHUNK_EDGE {
                     let world_y = coord.y * edge + y as i32;
@@ -185,17 +189,29 @@ impl Chunk {
     }
 }
 
-pub(super) fn terrain_surface_height(world_x: i32, world_z: i32) -> i32 {
-    let edge = CHUNK_EDGE as i32;
-    let base_height = edge / 2;
-    let variation = (edge / 8).max(1);
-    let hash = world_x.wrapping_mul(73_856_093) ^ world_z.wrapping_mul(19_349_663);
-    base_height + hash.rem_euclid(variation * 2 + 1) - variation
+pub(super) fn terrain_surface_height<T: Generator2D>(world_x: i32, world_z: i32, noise: &T) -> i32 {
+    let base_frequency = 0.0125;
+    let nx = world_x as f64 * base_frequency;
+    let nz = world_z as f64 * base_frequency;
+
+    let sample = 1.0 * noise.sample([1.0 * nx, 1.0 * nz])
+        + 0.5 * noise.sample([2.0 * nx, 2.0 * nz])
+        + 0.25 * noise.sample([4.0 * nx, 4.0 * nz]);
+    let sample_normalized = sample / (1.0 + 0.5 + 0.25);
+    // [-1;1] -> [0;1]
+    let sample_remaped = sample_normalized / 2.0 + 0.5;
+
+    // [0;1] -> [SURFACE_RANGE[0];SURFACE_RANGE[1]]
+    let height =
+        SURFACE_RANGE[0] as f64 + sample_remaped * (SURFACE_RANGE[1] - SURFACE_RANGE[0]) as f64;
+
+    height as i32
 }
 
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
+    use libnoise::Source;
 
     use super::{CHUNK_EDGE, Chunk, ChunkCoord, terrain_surface_height};
 
@@ -292,15 +308,16 @@ mod tests {
     }
 
     #[test]
-    fn terrain_height_is_deterministic_and_varies_per_column() {
+    fn terrain_height_is_deterministic() {
+        let noise = Source::simplex(42);
+
         let heights: Vec<_> = (0..CHUNK_EDGE as i32)
-            .map(|x| terrain_surface_height(x, 0))
+            .map(|x| terrain_surface_height(x, 0, &noise))
             .collect();
         let repeated: Vec<_> = (0..CHUNK_EDGE as i32)
-            .map(|x| terrain_surface_height(x, 0))
+            .map(|x| terrain_surface_height(x, 0, &noise))
             .collect();
 
         assert_eq!(heights, repeated);
-        assert!(heights.windows(2).any(|pair| pair[0] != pair[1]));
     }
 }

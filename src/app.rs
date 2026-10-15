@@ -43,7 +43,7 @@ impl Default for App {
             startup_error: None,
             camera: Camera::default(),
             camera_controller: CameraController::default(),
-            world: World::default(),
+            world: World::new(rand::random::<u64>()),
             debug_visualization: false,
             last_frame: Instant::now(),
             mouse_look_active: false,

@@ -1,6 +1,7 @@
 mod chunk;
 
 pub use chunk::{CHUNK_EDGE, Chunk, ChunkCoord, RayHit};
+use libnoise::Source;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -27,6 +28,8 @@ pub struct WorldChunkChanges {
 }
 
 pub struct World {
+    #[allow(unused)]
+    seed: u64,
     chunks: HashMap<ChunkCoord, Chunk>,
     stream_origin: Option<ChunkCoord>,
     stream_dimensions: [u32; 3],
@@ -57,9 +60,10 @@ struct ChunkGenerator {
 }
 
 impl ChunkGenerator {
-    fn new() -> Self {
+    fn new(seed: u64) -> Self {
         let (request_tx, request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
+        let noise = Source::simplex(seed);
         let worker = thread::Builder::new()
             .name("voxel-chunk-generator".into())
             .spawn(move || {
@@ -74,7 +78,7 @@ impl ChunkGenerator {
 
                     for coord in chunks {
                         let start = Instant::now();
-                        let chunk = Chunk::generate(coord);
+                        let chunk = Chunk::generate(coord, &noise);
                         let generated = GeneratedChunk {
                             epoch,
                             coord,
@@ -121,9 +125,10 @@ impl Drop for ChunkGenerator {
     }
 }
 
-impl Default for World {
-    fn default() -> Self {
+impl World {
+    pub fn new(seed: u64) -> Self {
         Self {
+            seed,
             chunks: HashMap::new(),
             stream_origin: None,
             stream_dimensions: [0; 3],
@@ -132,12 +137,10 @@ impl Default for World {
             chunk_changes: WorldChunkChanges::default(),
             generated_chunks_since_report: 0,
             generation_time_since_report: Duration::ZERO,
-            generator: ChunkGenerator::new(),
+            generator: ChunkGenerator::new(seed),
         }
     }
-}
 
-impl World {
     pub fn stream_around(&mut self, position: Vec3, radius: i32) -> bool {
         let center = ChunkCoord::from_voxel(
             position.x.floor() as i32,
@@ -159,9 +162,7 @@ impl World {
                 .chunks
                 .keys()
                 .copied()
-                .filter(|&coord| {
-                    !is_inside_stream(coord, origin, [diameter; 3], center, radius)
-                })
+                .filter(|&coord| !is_inside_stream(coord, origin, [diameter; 3], center, radius))
                 .collect();
             for coord in unloaded {
                 self.chunks.remove(&coord);
@@ -320,14 +321,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use glam::Vec3;
+    use libnoise::Source;
 
     use super::{CHUNK_EDGE, Chunk, ChunkCoord, STREAM_RADIUS, World};
 
     #[test]
     fn streaming_loads_and_unloads_a_chunk_size_aware_region() {
-        let mut world = World::default();
-        assert!(world.stream_around(Vec3::ZERO, 1));
-        wait_for_loaded_chunks(&mut world, Vec3::ZERO, 1, 15);
+        let mut world = World::new(42);
+        let radius = 1;
+        assert!(world.stream_around(Vec3::ZERO, radius));
+        wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 15);
         assert_eq!(world.loaded_chunk_count(), 15);
         assert!(world.chunk(ChunkCoord { x: 1, y: 0, z: 1 }).is_none());
         assert!(world.chunk(ChunkCoord { x: 0, y: 1, z: 0 }).is_some());
@@ -355,7 +358,7 @@ mod tests {
 
     #[test]
     fn one_chunk_window_shift_emits_only_entering_and_leaving_chunks() {
-        let mut world = World::default();
+        let mut world = World::new(42);
         let radius = 1;
         world.stream_around(Vec3::ZERO, radius);
         wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 15);
@@ -372,14 +375,17 @@ mod tests {
 
     #[test]
     fn generated_surface_uses_global_coordinates_across_chunk_boundaries() {
-        let mut world = World::default();
-        world.stream_around(Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1);
-        wait_for_loaded_chunks(&mut world, Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), 1, 15);
+        let seed = 42;
+        let radius = 3;
+        let mut world = World::new(seed);
+        world.stream_around(Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), radius);
+        wait_for_loaded_chunks(&mut world, Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), radius, 203);
         let edge = CHUNK_EDGE as i32;
+        let noise = Source::simplex(seed);
         for z in 0..CHUNK_EDGE {
             let global_z = z as i32;
-            let left_surface = super::chunk::terrain_surface_height(edge - 1, global_z);
-            let right_surface = super::chunk::terrain_surface_height(edge, global_z);
+            let left_surface = super::chunk::terrain_surface_height(edge - 1, global_z, &noise);
+            let right_surface = super::chunk::terrain_surface_height(edge, global_z, &noise);
             let left_y = left_surface.rem_euclid(edge) as usize;
             let right_y = right_surface.rem_euclid(edge) as usize;
             let left = world
@@ -400,9 +406,10 @@ mod tests {
             assert_eq!(right.voxel([0, right_y, z]), Some(1));
         }
     }
+
     #[test]
     fn default_stream_radius_is_nonempty() {
-        let mut world = World::default();
+        let mut world = World::new(42);
         world.stream_around(Vec3::ZERO, STREAM_RADIUS);
         wait_for_loaded_chunks(&mut world, Vec3::ZERO, STREAM_RADIUS, 891);
         assert_eq!(world.loaded_chunk_count(), 891);
@@ -410,7 +417,7 @@ mod tests {
 
     #[test]
     fn larger_stream_radius_generates_without_blocking_the_caller() {
-        let mut world = World::default();
+        let mut world = World::new(42);
         let radius = 3;
         world.stream_around(Vec3::ZERO, radius);
         wait_for_loaded_chunks(&mut world, Vec3::ZERO, radius, 203);
@@ -418,7 +425,7 @@ mod tests {
 
     #[test]
     fn latest_stream_request_discards_stale_generation_results() {
-        let mut world = World::default();
+        let mut world = World::new(42);
         world.stream_around(Vec3::ZERO, STREAM_RADIUS);
         let latest_position = Vec3::new((CHUNK_EDGE * 8) as f32, 0.0, 0.0);
         world.stream_around(latest_position, 1);
@@ -435,7 +442,7 @@ mod tests {
     fn cpu_world_raycast_crosses_chunk_boundaries() {
         let edge = CHUNK_EDGE as i32;
         let middle = CHUNK_EDGE / 2;
-        let mut world = World::default();
+        let mut world = World::new(42);
         world.stream_around(Vec3::splat(edge as f32), 1);
 
         world.insert_chunk(ChunkCoord { x: 0, y: 1, z: 1 }, Chunk::new());
