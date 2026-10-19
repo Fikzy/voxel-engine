@@ -15,6 +15,7 @@ use crate::camera::Camera;
 use crate::camera::controller::CameraController;
 use crate::renderer::Renderer;
 use crate::world::{STREAM_RADIUS, World};
+use crate::world_interactor::WorldInteractor;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -23,6 +24,7 @@ struct App {
     camera: Camera,
     camera_controller: CameraController,
     world: World,
+    world_interactor: WorldInteractor,
     debug_visualization: bool,
     last_frame: Instant,
     mouse_look_active: bool,
@@ -44,6 +46,7 @@ impl Default for App {
             camera: Camera::default(),
             camera_controller: CameraController::default(),
             world: World::new(rand::random::<u64>()),
+            world_interactor: WorldInteractor::default(),
             debug_visualization: false,
             last_frame: Instant::now(),
             mouse_look_active: false,
@@ -188,11 +191,19 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(false) => self.set_mouse_look(false),
-            WindowEvent::MouseInput {
-                button: MouseButton::Left,
-                state: ElementState::Pressed,
-                ..
-            } if !self.mouse_look_active => self.set_mouse_look(true),
+            WindowEvent::MouseInput { button, state, .. } => {
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        if !self.mouse_look_active {
+                            self.set_mouse_look(true);
+                        }
+                    }
+                    _ => (),
+                };
+                if self.mouse_look_active {
+                    self.world_interactor.process_mouse_input(button, state);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.physical_key == PhysicalKey::Code(KeyCode::F1)
                     && event.state.is_pressed()
@@ -213,6 +224,7 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     self.camera_controller.process_key(&event);
+                    self.world_interactor.process_key(&event);
                 }
             }
             WindowEvent::Resized(size) => {
@@ -225,20 +237,22 @@ impl ApplicationHandler for App {
                 self.camera_controller
                     .update(&mut self.camera, now - self.last_frame);
                 self.last_frame = now;
+
+                self.world_interactor.update(&self.camera, &mut self.world);
+
                 let stream_started = Instant::now();
-                let world_changed = self
-                    .world
+                // Load chunks around camera
+                self.world
                     .stream_around(self.camera.position, STREAM_RADIUS);
                 let stream_time = stream_started.elapsed();
+
                 let mut sync_time = Duration::ZERO;
                 let mut render_time = Duration::ZERO;
                 if let Some(renderer) = &mut self.renderer {
-                    if world_changed {
-                        let changes = self.world.take_chunk_changes();
-                        let sync_started = Instant::now();
-                        renderer.update_world(&self.world, changes);
-                        sync_time = sync_started.elapsed();
-                    }
+                    let changes = self.world.take_chunk_changes();
+                    let sync_started = Instant::now();
+                    renderer.update_world(&self.world, changes);
+                    sync_time = sync_started.elapsed();
                     let render_started = Instant::now();
                     if let Err(error) = renderer.render(
                         self.camera.view_projection(renderer.aspect_ratio()),

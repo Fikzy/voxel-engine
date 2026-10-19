@@ -21,9 +21,10 @@ pub struct WorldRayHit {
     pub distance: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorldChunkChanges {
     pub loaded: Vec<ChunkCoord>,
+    pub updated: Vec<ChunkCoord>,
     pub unloaded: Vec<ChunkCoord>,
 }
 
@@ -294,6 +295,26 @@ impl World {
         removed
     }
 
+    pub fn set_voxel(&mut self, voxel: [i32; 3], new_material: u8) {
+        let chunk_coord = ChunkCoord::from_voxel(voxel[0], voxel[1], voxel[2]);
+        let local_voxel = ChunkCoord::local_voxel(voxel[0], voxel[1], voxel[2]);
+        if let Some(chunk) = self.chunks.get_mut(&chunk_coord) {
+            if let Some(prev_material) = chunk.voxel(local_voxel) {
+                println!(
+                    "Changed voxel ({}, {}, {}) from {} to {}",
+                    voxel[0], voxel[1], voxel[2], prev_material, new_material
+                );
+            } else {
+                println!(
+                    "Set undefined voxel ({}, {}, {}) to {}",
+                    voxel[0], voxel[1], voxel[2], new_material
+                );
+            }
+            chunk.set_voxel(local_voxel, new_material);
+            self.chunk_changes.updated.push(chunk_coord);
+        }
+    }
+
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunks.len()
     }
@@ -379,15 +400,20 @@ mod tests {
         let radius = 3;
         let mut world = World::new(seed);
         world.stream_around(Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), radius);
-        wait_for_loaded_chunks(&mut world, Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0), radius, 203);
+        wait_for_loaded_chunks(
+            &mut world,
+            Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0),
+            radius,
+            203,
+        );
         let edge = CHUNK_EDGE as i32;
         let noise = Source::simplex(seed);
         for z in 0..CHUNK_EDGE {
             let global_z = z as i32;
             let left_surface = super::chunk::terrain_surface_height(edge - 1, global_z, &noise);
             let right_surface = super::chunk::terrain_surface_height(edge, global_z, &noise);
-            let left_y = left_surface.rem_euclid(edge) as usize;
-            let right_y = right_surface.rem_euclid(edge) as usize;
+            let left_y = left_surface.rem_euclid(edge);
+            let right_y = right_surface.rem_euclid(edge);
             let left = world
                 .chunk(ChunkCoord {
                     x: 0,
@@ -402,8 +428,11 @@ mod tests {
                     z: 0,
                 })
                 .unwrap();
-            assert_eq!(left.voxel([CHUNK_EDGE - 1, left_y, z]), Some(1));
-            assert_eq!(right.voxel([0, right_y, z]), Some(1));
+            assert_eq!(
+                left.voxel([(CHUNK_EDGE - 1) as i32, left_y, z as i32]),
+                Some(1)
+            );
+            assert_eq!(right.voxel([0, right_y, z as i32]), Some(1));
         }
     }
 
@@ -441,13 +470,13 @@ mod tests {
     #[test]
     fn cpu_world_raycast_crosses_chunk_boundaries() {
         let edge = CHUNK_EDGE as i32;
-        let middle = CHUNK_EDGE / 2;
+        let middle = (CHUNK_EDGE / 2) as i32;
         let mut world = World::new(42);
         world.stream_around(Vec3::splat(edge as f32), 1);
 
         world.insert_chunk(ChunkCoord { x: 0, y: 1, z: 1 }, Chunk::new());
         let mut next_chunk = Chunk::new();
-        let target_x = 1.min(CHUNK_EDGE - 1);
+        let target_x = 1.min(CHUNK_EDGE - 1) as i32;
         next_chunk.set_voxel([target_x, middle, middle], 2);
         world.insert_chunk(ChunkCoord { x: 1, y: 1, z: 1 }, next_chunk);
 
@@ -471,6 +500,55 @@ mod tests {
             ]
         );
         assert_eq!(hit.material, 2);
+    }
+
+    #[test]
+    fn voxel_edits_report_the_affected_chunk_as_updated() {
+        let edge = CHUNK_EDGE as i32;
+        let mut world = World::new(42);
+        let mut chunk = Chunk::new();
+        chunk.set_voxel([edge - 1, 0, 0], 1);
+        chunk.set_voxel([0, edge - 1, edge - 1], 3);
+        world.insert_chunk(ChunkCoord { x: -1, y: 0, z: -1 }, chunk);
+        world.take_chunk_changes();
+
+        // Breaking the voxel at the chunk's highest x coordinate.
+        world.set_voxel([-1, 0, -edge], 0);
+        let changes = world.take_chunk_changes();
+        assert_eq!(changes.updated, vec![ChunkCoord { x: -1, y: 0, z: -1 }]);
+        assert!(changes.loaded.is_empty());
+        assert!(changes.unloaded.is_empty());
+        assert_eq!(
+            world
+                .chunk(ChunkCoord { x: -1, y: 0, z: -1 })
+                .unwrap()
+                .voxel([edge - 1, 0, 0]),
+            Some(0)
+        );
+
+        // Placing a block in a previously empty voxel of a neighbouring chunk.
+        world.set_voxel([-edge, edge - 1, -1], 4);
+        let changes = world.take_chunk_changes();
+        assert_eq!(changes.updated, vec![ChunkCoord { x: -1, y: 0, z: -1 }]);
+        assert_eq!(
+            world
+                .chunk(ChunkCoord { x: -1, y: 0, z: -1 })
+                .unwrap()
+                .voxel([0, edge - 1, edge - 1]),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn voxel_edits_to_unloaded_chunks_are_ignored() {
+        let mut world = World::new(42);
+        world.set_voxel([0, 0, 0], 1);
+        world.set_voxel([-(CHUNK_EDGE as i32), 0, 0], 2);
+        let changes = world.take_chunk_changes();
+        assert!(changes.updated.is_empty());
+        assert!(changes.loaded.is_empty());
+        assert!(changes.unloaded.is_empty());
+        assert_eq!(world.loaded_chunk_count(), 0);
     }
 
     fn wait_for_loaded_chunks(world: &mut World, position: Vec3, radius: i32, expected: usize) {

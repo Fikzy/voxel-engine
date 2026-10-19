@@ -359,26 +359,15 @@ impl Renderer {
             self.chunk_residency_buffer = residency;
             self.uploaded_chunk_coords = uploaded;
         } else {
-            for coord in changes.unloaded {
-                self.uploaded_chunk_coords.remove(&coord);
-                if let Some(index) = residency_index(coord, dimensions) {
-                    write_residency(&self.queue, &self.chunk_residency_buffer, index, false);
-                }
-            }
-
-            for coord in changes.loaded {
-                if self.uploaded_chunk_coords.contains(&coord) {
-                    continue;
-                }
-                let Some(chunk) = world.chunk(coord) else {
-                    continue;
-                };
-                upload_chunk_region(&self.queue, &self._voxel_atlas, chunk, coord, dimensions);
-                if let Some(index) = residency_index(coord, dimensions) {
-                    write_residency(&self.queue, &self.chunk_residency_buffer, index, true);
-                    self.uploaded_chunk_coords.insert(coord);
-                }
-            }
+            apply_chunk_changes(
+                &self.queue,
+                &self._voxel_atlas,
+                &self.chunk_residency_buffer,
+                &mut self.uploaded_chunk_coords,
+                world,
+                changes,
+                dimensions,
+            );
         }
 
         self.stream_origin = origin;
@@ -689,6 +678,48 @@ fn write_residency(queue: &wgpu::Queue, buffer: &wgpu::Buffer, index: usize, loa
     );
 }
 
+/// Apply loaded, updated and unloaded chunk changes to the streamed voxel atlas.
+///
+/// Updated chunks are re-uploaded without touching residency, so edits made to
+/// already-resident chunks become visible on the GPU.
+pub(crate) fn apply_chunk_changes(
+    queue: &wgpu::Queue,
+    atlas: &wgpu::Texture,
+    residency_buffer: &wgpu::Buffer,
+    uploaded: &mut HashSet<ChunkCoord>,
+    world: &World,
+    changes: WorldChunkChanges,
+    dimensions: [u32; 3],
+) {
+    for coord in changes.unloaded {
+        uploaded.remove(&coord);
+        if let Some(index) = residency_index(coord, dimensions) {
+            write_residency(queue, residency_buffer, index, false);
+        }
+    }
+
+    for coord in changes.loaded {
+        if uploaded.contains(&coord) {
+            continue;
+        }
+        let Some(chunk) = world.chunk(coord) else {
+            continue;
+        };
+        upload_chunk_region(queue, atlas, chunk, coord, dimensions);
+        if let Some(index) = residency_index(coord, dimensions) {
+            write_residency(queue, residency_buffer, index, true);
+            uploaded.insert(coord);
+        }
+    }
+
+    for coord in changes.updated {
+        let Some(chunk) = world.chunk(coord) else {
+            continue;
+        };
+        upload_chunk_region(queue, atlas, chunk, coord, dimensions);
+    }
+}
+
 fn upload_chunk_region(
     queue: &wgpu::Queue,
     atlas: &wgpu::Texture,
@@ -786,7 +817,8 @@ mod tests {
     use wgpu::util::DeviceExt;
 
     use super::{
-        CameraUniform, RAYCAST_FORMAT, create_raycast_output, create_voxel_atlas, residency_index,
+        CameraUniform, RAYCAST_FORMAT, apply_chunk_changes, create_raycast_output,
+        create_voxel_atlas, residency_index,
     };
     use crate::world::{CHUNK_EDGE, Chunk, ChunkCoord, World};
 
@@ -810,6 +842,282 @@ mod tests {
             residency_index(resident, dimensions),
             residency_index(ChunkCoord { x: -2, y: 4, z: 8 }, dimensions)
         );
+    }
+
+    #[test]
+    fn chunk_changes_reupload_resident_chunks_and_clear_residency() {
+        pollster::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let Ok(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    apply_limit_buckets: false,
+                })
+                .await
+            else {
+                eprintln!("skipping chunk change sync check: no adapter available");
+                return;
+            };
+            let Ok((device, queue)) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+            else {
+                eprintln!("skipping chunk change sync check: device unavailable");
+                return;
+            };
+
+            let edge = CHUNK_EDGE as i32;
+            let middle = (CHUNK_EDGE / 2) as i32;
+            let mut world = World::new(42);
+            world.stream_around(Vec3::splat(edge as f32), 1);
+            let mut first_chunk = Chunk::new();
+            first_chunk.set_voxel([middle, middle, middle], 1);
+            world.insert_chunk(ChunkCoord { x: 0, y: 1, z: 1 }, first_chunk);
+            let mut next_chunk = Chunk::new();
+            next_chunk.set_voxel([1.min(CHUNK_EDGE - 1) as i32, middle, middle], 2);
+            world.insert_chunk(ChunkCoord { x: 1, y: 1, z: 1 }, next_chunk);
+            let (stream_origin, dimensions) = world.stream_bounds().unwrap();
+            let (voxel_atlas, voxel_view, chunk_residency_buffer, mut uploaded) =
+                create_voxel_atlas(&device, &queue, &world, stream_origin, dimensions);
+            assert!(uploaded.contains(&ChunkCoord { x: 1, y: 1, z: 1 }));
+            // The atlas already reflects the chunks that were present when it was
+            // built, so the queued insertions are consumed here.
+            let atlas_changes = world.take_chunk_changes();
+            assert_eq!(
+                atlas_changes.loaded,
+                vec![
+                    ChunkCoord { x: 0, y: 1, z: 1 },
+                    ChunkCoord { x: 1, y: 1, z: 1 },
+                ]
+            );
+            assert!(atlas_changes.updated.is_empty());
+            assert!(atlas_changes.unloaded.is_empty());
+
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Chunk change sync test shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("raycast.wgsl").into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Chunk change sync test pipeline"),
+                layout: None,
+                module: &shader,
+                entry_point: Some("validate_rays"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk change sync test camera"),
+                contents: bytemuck::bytes_of(&CameraUniform {
+                    chunk_origin: [stream_origin.x, stream_origin.y, stream_origin.z, 0],
+                    chunk_grid: [
+                        dimensions[0],
+                        dimensions[1],
+                        dimensions[2],
+                        CHUNK_EDGE as u32,
+                    ],
+                    ..CameraUniform::zeroed()
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let voxel_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Chunk change sync test voxel binding"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&voxel_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: chunk_residency_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            // A ray crossing both chunk boundaries, aimed at the voxel the
+            // resident chunk holds at its first interior column.
+            let probe = RayProbe {
+                origin: Vec3::new(
+                    edge as f32 - 1.5,
+                    edge as f32 + middle as f32 + 0.5,
+                    edge as f32 + middle as f32 + 0.5,
+                )
+                .extend(0.0)
+                .to_array(),
+                direction: Vec3::X.extend(0.0).to_array(),
+            };
+            let probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk change sync test probe"),
+                contents: bytemuck::bytes_of(&probe),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let result_size = std::mem::size_of::<[u32; 4]>() as u64;
+            let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk change sync test results"),
+                size: result_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk change sync test readback"),
+                size: result_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let probe_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Chunk change sync test probe binding"),
+                layout: &pipeline.get_bind_group_layout(1),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: probe_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: result_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let cpu_expectation = |world: &World| -> [u32; 4] {
+                world
+                    .raycast(
+                        Vec3::from_array([probe.origin[0], probe.origin[1], probe.origin[2]]),
+                        Vec3::from_array([
+                            probe.direction[0],
+                            probe.direction[1],
+                            probe.direction[2],
+                        ]),
+                        edge as f32 * 8.0,
+                    )
+                    .map_or([u32::MAX, u32::MAX, u32::MAX, 0], |cpu_hit| {
+                        [
+                            cpu_hit.voxel[0] as u32,
+                            cpu_hit.voxel[1] as u32,
+                            cpu_hit.voxel[2] as u32,
+                            cpu_hit.material as u32,
+                        ]
+                    })
+            };
+
+            let probe_world_state = || -> [u32; 4] {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Chunk change sync test encoder"),
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Chunk change sync test pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &voxel_bind_group, &[]);
+                    pass.set_bind_group(1, &probe_bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                encoder.copy_buffer_to_buffer(&result_buffer, 0, &readback_buffer, 0, result_size);
+                queue.submit([encoder.finish()]);
+
+                let range = readback_buffer.slice(..);
+                let (sender, receiver) = mpsc::channel();
+                range.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .unwrap();
+                receiver.recv().unwrap().unwrap();
+                let mapped = range.get_mapped_range().unwrap();
+                let hit: [u32; 4] = bytemuck::cast_slice(&mapped)[0];
+                drop(mapped);
+                readback_buffer.unmap();
+                hit
+            };
+
+            let hit = probe_world_state();
+            assert_eq!(
+                hit,
+                [
+                    (edge + 1) as u32,
+                    (edge + middle) as u32,
+                    (edge + middle) as u32,
+                    2,
+                ]
+            );
+            assert_eq!(hit, cpu_expectation(&world));
+
+            // Breaking the voxel must be visible on the GPU without any residency change.
+            world.set_voxel([edge + 1, edge + middle, edge + middle], 0);
+            let changes = world.take_chunk_changes();
+            assert_eq!(changes.updated, vec![ChunkCoord { x: 1, y: 1, z: 1 }]);
+            assert!(changes.loaded.is_empty());
+            assert!(changes.unloaded.is_empty());
+            apply_chunk_changes(
+                &queue,
+                &voxel_atlas,
+                &chunk_residency_buffer,
+                &mut uploaded,
+                &world,
+                changes,
+                dimensions,
+            );
+            assert!(uploaded.contains(&ChunkCoord { x: 1, y: 1, z: 1 }));
+            assert_eq!(probe_world_state(), [u32::MAX, u32::MAX, u32::MAX, 0]);
+            assert_eq!(probe_world_state(), cpu_expectation(&world));
+
+            // Placing a block in a previously empty voxel of the same chunk.
+            world.set_voxel([edge, edge + middle, edge + middle], 5);
+            let changes = world.take_chunk_changes();
+            assert_eq!(changes.updated, vec![ChunkCoord { x: 1, y: 1, z: 1 }]);
+            apply_chunk_changes(
+                &queue,
+                &voxel_atlas,
+                &chunk_residency_buffer,
+                &mut uploaded,
+                &world,
+                changes,
+                dimensions,
+            );
+            assert_eq!(
+                probe_world_state(),
+                [
+                    edge as u32,
+                    (edge + middle) as u32,
+                    (edge + middle) as u32,
+                    5,
+                ]
+            );
+            assert_eq!(probe_world_state(), cpu_expectation(&world));
+
+            // Unloading a chunk clears residency so traversal ignores it again.
+            world.remove_chunk(ChunkCoord { x: 1, y: 1, z: 1 });
+            let changes = world.take_chunk_changes();
+            assert_eq!(changes.unloaded, vec![ChunkCoord { x: 1, y: 1, z: 1 }]);
+            apply_chunk_changes(
+                &queue,
+                &voxel_atlas,
+                &chunk_residency_buffer,
+                &mut uploaded,
+                &world,
+                changes,
+                dimensions,
+            );
+            assert!(!uploaded.contains(&ChunkCoord { x: 1, y: 1, z: 1 }));
+            assert!(world.chunk(ChunkCoord { x: 1, y: 1, z: 1 }).is_none());
+            // The ray travels +X from inside chunk (0, 1, 1), so with (1, 1, 1)
+            // unloaded there is nothing left to hit.
+            assert_eq!(probe_world_state(), [u32::MAX, u32::MAX, u32::MAX, 0]);
+            assert_eq!(probe_world_state(), cpu_expectation(&world));
+        });
     }
 
     #[test]
@@ -838,14 +1146,14 @@ mod tests {
             };
 
             let edge = CHUNK_EDGE as i32;
-            let middle = CHUNK_EDGE / 2;
+            let middle = (CHUNK_EDGE / 2) as i32;
             let mut world = World::new(42);
             world.stream_around(Vec3::splat(edge as f32), 1);
             let mut first_chunk = Chunk::new();
             first_chunk.set_voxel([middle, middle, middle], 1);
             world.insert_chunk(ChunkCoord { x: 0, y: 1, z: 1 }, first_chunk);
             let mut next_chunk = Chunk::new();
-            next_chunk.set_voxel([1.min(CHUNK_EDGE - 1), middle, middle], 2);
+            next_chunk.set_voxel([1.min(CHUNK_EDGE - 1) as i32, middle, middle], 2);
             world.insert_chunk(ChunkCoord { x: 1, y: 1, z: 1 }, next_chunk);
             let (stream_origin, stream_dimensions) = world.stream_bounds().unwrap();
             let (_voxel_atlas, voxel_view, chunk_residency_buffer, _uploaded_chunks) =

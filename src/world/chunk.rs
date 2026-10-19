@@ -23,13 +23,9 @@ impl ChunkCoord {
         }
     }
 
-    pub fn local_voxel(x: i32, y: i32, z: i32) -> [usize; 3] {
+    pub fn local_voxel(x: i32, y: i32, z: i32) -> [i32; 3] {
         let edge = CHUNK_EDGE as i32;
-        [
-            x.rem_euclid(edge) as usize,
-            y.rem_euclid(edge) as usize,
-            z.rem_euclid(edge) as usize,
-        ]
+        [x.rem_euclid(edge), y.rem_euclid(edge), z.rem_euclid(edge)]
     }
 }
 
@@ -39,7 +35,7 @@ pub struct Chunk {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayHit {
-    pub voxel: [usize; 3],
+    pub voxel: [i32; 3],
     pub material: u8,
     pub distance: f32,
 }
@@ -78,7 +74,7 @@ impl Chunk {
                         } else {
                             3
                         };
-                        chunk.set_voxel([x, y, z], material);
+                        chunk.set_voxel([x as i32, y as i32, z as i32], material);
                     }
                 }
             }
@@ -86,11 +82,11 @@ impl Chunk {
         chunk
     }
 
-    pub fn voxel(&self, local: [usize; 3]) -> Option<u8> {
+    pub fn voxel(&self, local: [i32; 3]) -> Option<u8> {
         Self::index(local).map(|index| self.voxels[index])
     }
 
-    pub fn set_voxel(&mut self, local: [usize; 3], material: u8) -> bool {
+    pub fn set_voxel(&mut self, local: [i32; 3], material: u8) -> bool {
         let Some(index) = Self::index(local) else {
             return false;
         };
@@ -152,11 +148,10 @@ impl Chunk {
             {
                 return None;
             }
-            let local = [voxel[0] as usize, voxel[1] as usize, voxel[2] as usize];
-            let material = self.voxel(local)?;
+            let material = self.voxel(voxel)?;
             if material != 0 {
                 return Some(RayHit {
-                    voxel: local,
+                    voxel,
                     material,
                     distance,
                 });
@@ -181,11 +176,12 @@ impl Chunk {
         &self.voxels
     }
 
-    fn index([x, y, z]: [usize; 3]) -> Option<usize> {
-        if x >= CHUNK_EDGE || y >= CHUNK_EDGE || z >= CHUNK_EDGE {
+    fn index([x, y, z]: [i32; 3]) -> Option<usize> {
+        let edge = CHUNK_EDGE as i32;
+        if x < 0 || y < 0 || z < 0 || x >= edge || y >= edge || z >= edge {
             return None;
         }
-        Some(x + CHUNK_EDGE * (y + CHUNK_EDGE * z))
+        Some((x + edge * (y + edge * z)) as usize)
     }
 }
 
@@ -228,25 +224,38 @@ mod tests {
         );
         assert_eq!(
             ChunkCoord::local_voxel(-1, -edge, -edge - 1),
-            [CHUNK_EDGE - 1, 0, CHUNK_EDGE - 1]
+            [edge - 1, 0, edge - 1]
         );
     }
 
     #[test]
     fn stores_materials_at_valid_local_coordinates() {
         let mut chunk = Chunk::new();
-        let valid = [CHUNK_EDGE - 1, CHUNK_EDGE / 2, CHUNK_EDGE / 2];
+        let edge = CHUNK_EDGE as i32;
+        let valid = [edge - 1, edge / 2, edge / 2];
         assert!(chunk.set_voxel(valid, 7));
         assert_eq!(chunk.voxel(valid), Some(7));
-        assert_eq!(chunk.voxel([CHUNK_EDGE, 0, 0]), None);
-        assert!(!chunk.set_voxel([0, 0, CHUNK_EDGE], 1));
+        assert_eq!(chunk.voxel([edge, 0, 0]), None);
+        assert!(!chunk.set_voxel([0, 0, edge], 1));
+    }
+
+    #[test]
+    fn rejects_local_coordinates_outside_the_chunk() {
+        let mut chunk = Chunk::new();
+        let edge = CHUNK_EDGE as i32;
+        assert!(!chunk.set_voxel([-1, 0, 0], 1));
+        assert!(!chunk.set_voxel([0, -1, 0], 1));
+        assert!(!chunk.set_voxel([0, 0, -1], 1));
+        assert_eq!(chunk.voxel([-1, 0, 0]), None);
+        assert_eq!(chunk.voxel([0, -1, edge]), None);
+        assert_eq!(chunk.voxel([edge - 1, edge - 1, edge - 1]), Some(0));
     }
 
     #[test]
     fn raycast_hits_known_voxels_and_respects_chunk_edges() {
         let edge = CHUNK_EDGE as f32;
-        let middle = CHUNK_EDGE / 2;
-        let depth = CHUNK_EDGE / 4;
+        let middle = (CHUNK_EDGE / 2) as i32;
+        let depth = (CHUNK_EDGE / 4) as i32;
         let mut chunk = Chunk::new();
         if CHUNK_EDGE < 3 {
             chunk.set_voxel([0, 0, 0], 1);
@@ -258,7 +267,7 @@ mod tests {
             return;
         }
         chunk.set_voxel([middle, middle, depth], 1);
-        chunk.set_voxel([CHUNK_EDGE - 1, middle, depth], 2);
+        chunk.set_voxel([(CHUNK_EDGE - 1) as i32, middle, depth], 2);
         chunk.set_voxel([0, middle, depth], 3);
 
         let center_hit = chunk
@@ -278,7 +287,7 @@ mod tests {
                 edge * 2.0,
             )
             .unwrap();
-        assert_eq!(edge_hit.voxel, [CHUNK_EDGE - 1, middle, depth]);
+        assert_eq!(edge_hit.voxel, [(CHUNK_EDGE - 1) as i32, middle, depth]);
         assert_eq!(edge_hit.material, 2);
 
         assert!(
