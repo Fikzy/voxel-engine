@@ -35,72 +35,108 @@ pub struct World {
     stream_origin: Option<ChunkCoord>,
     stream_dimensions: [u32; 3],
     generation_epoch: u64,
-    pending_generation: HashSet<ChunkCoord>,
+    pending_chunks: HashSet<ChunkCoord>,
     chunk_changes: WorldChunkChanges,
     generated_chunks_since_report: u32,
     generation_time_since_report: Duration,
-    generator: ChunkGenerator,
+    chunk_manager: ChunkManager,
 }
 
-enum GenerationRequest {
-    Generate { epoch: u64, chunks: Vec<ChunkCoord> },
+enum ChunkManagerRequest {
+    Update {
+        epoch: u64,
+        unload: Vec<(ChunkCoord, Chunk)>,
+        load: Vec<ChunkCoord>,
+    },
+    Discard {
+        coord: ChunkCoord,
+    },
     Shutdown,
 }
 
-struct GeneratedChunk {
+struct LoadedChunk {
     epoch: u64,
     coord: ChunkCoord,
     chunk: Chunk,
-    generation_time: Duration,
+    generation_time: Option<Duration>,
 }
 
-struct ChunkGenerator {
-    requests: Sender<GenerationRequest>,
-    results: Receiver<GeneratedChunk>,
+struct ChunkManager {
+    requests: Sender<ChunkManagerRequest>,
+    results: Receiver<LoadedChunk>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl ChunkGenerator {
+impl ChunkManager {
     fn new(seed: u64) -> Self {
         let (request_tx, request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let noise = Source::simplex(seed);
         let worker = thread::Builder::new()
-            .name("voxel-chunk-generator".into())
+            .name("voxel-chunk-manager".into())
             .spawn(move || {
+                let mut cached_chunks = HashMap::new();
                 let mut request = request_rx.recv();
                 'worker: loop {
-                    let GenerationRequest::Generate { epoch, chunks } = (match request {
-                        Ok(request) => request,
-                        Err(_) => break,
-                    }) else {
-                        break;
+                    let (epoch, unload, load) = match request {
+                        Ok(ChunkManagerRequest::Update {
+                            epoch,
+                            unload,
+                            load,
+                        }) => (epoch, unload, load),
+                        Ok(ChunkManagerRequest::Discard { coord }) => {
+                            cached_chunks.remove(&coord);
+                            request = request_rx.recv();
+                            continue;
+                        }
+                        Ok(ChunkManagerRequest::Shutdown) | Err(_) => break,
                     };
 
-                    for coord in chunks {
-                        let start = Instant::now();
-                        let chunk = Chunk::generate(coord, &noise);
-                        let generated = GeneratedChunk {
+                    cached_chunks.extend(unload);
+                    for coord in load {
+                        let (chunk, generation_time) =
+                            if let Some(chunk) = cached_chunks.remove(&coord) {
+                                (chunk, None)
+                            } else {
+                                let start = Instant::now();
+                                let chunk = Chunk::generate(coord, &noise);
+                                (chunk, Some(start.elapsed()))
+                            };
+                        let loaded = LoadedChunk {
                             epoch,
                             coord,
                             chunk,
-                            generation_time: start.elapsed(),
+                            generation_time,
                         };
-                        if result_tx.send(generated).is_err() {
+                        if result_tx.send(loaded).is_err() {
                             break 'worker;
                         }
 
-                        let mut latest_request = None;
+                        let mut latest_update = None;
                         loop {
                             match request_rx.try_recv() {
-                                Ok(GenerationRequest::Shutdown) => break 'worker,
-                                Ok(next_request) => latest_request = Some(next_request),
+                                Ok(ChunkManagerRequest::Shutdown) => break 'worker,
+                                Ok(ChunkManagerRequest::Discard { coord }) => {
+                                    cached_chunks.remove(&coord);
+                                }
+                                Ok(ChunkManagerRequest::Update {
+                                    epoch,
+                                    unload,
+                                    load,
+                                }) => {
+                                    cached_chunks.extend(unload);
+                                    latest_update = Some((epoch, load));
+                                }
                                 Err(TryRecvError::Disconnected) => break 'worker,
                                 Err(TryRecvError::Empty) => break,
                             }
                         }
-                        if let Some(next_request) = latest_request {
-                            request = Ok(next_request);
+                        if let Some((epoch, load)) = latest_update {
+                            request = Ok(ChunkManagerRequest::Update {
+                                epoch,
+                                unload: Vec::new(),
+                                load,
+                            });
                             continue 'worker;
                         }
                     }
@@ -115,11 +151,23 @@ impl ChunkGenerator {
             worker: Some(worker),
         }
     }
+
+    fn update(&self, epoch: u64, unload: Vec<(ChunkCoord, Chunk)>, load: Vec<ChunkCoord>) {
+        let _ = self.requests.send(ChunkManagerRequest::Update {
+            epoch,
+            unload,
+            load,
+        });
+    }
+
+    fn discard(&self, coord: ChunkCoord) {
+        let _ = self.requests.send(ChunkManagerRequest::Discard { coord });
+    }
 }
 
-impl Drop for ChunkGenerator {
+impl Drop for ChunkManager {
     fn drop(&mut self) {
-        let _ = self.requests.send(GenerationRequest::Shutdown);
+        let _ = self.requests.send(ChunkManagerRequest::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -134,11 +182,11 @@ impl World {
             stream_origin: None,
             stream_dimensions: [0; 3],
             generation_epoch: 0,
-            pending_generation: HashSet::new(),
+            pending_chunks: HashSet::new(),
             chunk_changes: WorldChunkChanges::default(),
             generated_chunks_since_report: 0,
             generation_time_since_report: Duration::ZERO,
-            generator: ChunkGenerator::new(seed),
+            chunk_manager: ChunkManager::new(seed),
         }
     }
 
@@ -165,9 +213,12 @@ impl World {
                 .copied()
                 .filter(|&coord| !is_inside_stream(coord, origin, [diameter; 3], center, radius))
                 .collect();
+            let mut chunks_to_cache = Vec::with_capacity(unloaded.len());
             for coord in unloaded {
-                self.chunks.remove(&coord);
-                self.chunk_changes.unloaded.push(coord);
+                if let Some(chunk) = self.chunks.remove(&coord) {
+                    chunks_to_cache.push((coord, chunk));
+                    self.chunk_changes.unloaded.push(coord);
+                }
             }
             self.stream_origin = Some(origin);
             self.stream_dimensions = [diameter; 3];
@@ -190,7 +241,7 @@ impl World {
                     }
                 }
             }
-            self.pending_generation = missing.iter().copied().collect();
+            self.pending_chunks = missing.iter().copied().collect();
             // Sort chunks by distance from center to prioritize their loading
             missing.sort_by_key(|coord| {
                 let dx = i64::from(coord.x - center.x);
@@ -198,27 +249,27 @@ impl World {
                 let dz = i64::from(coord.z - center.z);
                 (dx * dx + dy * dy + dz * dz, coord.z, coord.y, coord.x)
             });
-            let _ = self.generator.requests.send(GenerationRequest::Generate {
-                epoch: self.generation_epoch,
-                chunks: missing,
-            });
+            self.chunk_manager
+                .update(self.generation_epoch, chunks_to_cache, missing);
         }
 
         let mut integrated = 0;
         while integrated < MAX_CHUNKS_INTEGRATED_PER_FRAME {
-            let Ok(generated) = self.generator.results.try_recv() else {
+            let Ok(loaded) = self.chunk_manager.results.try_recv() else {
                 break;
             };
-            if generated.epoch == self.generation_epoch
-                && is_inside_stream(generated.coord, origin, [diameter; 3], center, radius)
+            if loaded.epoch == self.generation_epoch
+                && is_inside_stream(loaded.coord, origin, [diameter; 3], center, radius)
+                && self.pending_chunks.remove(&loaded.coord)
             {
-                self.pending_generation.remove(&generated.coord);
-                let was_missing = !self.chunks.contains_key(&generated.coord);
+                let was_missing = !self.chunks.contains_key(&loaded.coord);
                 if was_missing {
-                    self.chunks.insert(generated.coord, generated.chunk);
-                    self.chunk_changes.loaded.push(generated.coord);
-                    self.generated_chunks_since_report += 1;
-                    self.generation_time_since_report += generated.generation_time;
+                    self.chunks.insert(loaded.coord, loaded.chunk);
+                    self.chunk_changes.loaded.push(loaded.coord);
+                    if let Some(generation_time) = loaded.generation_time {
+                        self.generated_chunks_since_report += 1;
+                        self.generation_time_since_report += generation_time;
+                    }
                     integrated += 1;
                     changed = true;
                 }
@@ -245,7 +296,7 @@ impl World {
     }
 
     pub fn pending_chunk_count(&self) -> usize {
-        self.pending_generation.len()
+        self.pending_chunks.len()
     }
 
     pub fn take_generation_timings(&mut self) -> (u32, Duration) {
@@ -277,8 +328,9 @@ impl World {
     }
 
     pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: Chunk) -> Option<Chunk> {
+        self.chunk_manager.discard(coord);
         let previous = self.chunks.insert(coord, chunk);
-        self.pending_generation.remove(&coord);
+        self.pending_chunks.remove(&coord);
         if previous.is_none() {
             self.chunk_changes.loaded.push(coord);
         } else if !self.chunk_changes.loaded.contains(&coord) {
@@ -288,6 +340,8 @@ impl World {
     }
 
     pub fn remove_chunk(&mut self, coord: ChunkCoord) -> Option<Chunk> {
+        self.chunk_manager.discard(coord);
+        self.pending_chunks.remove(&coord);
         let removed = self.chunks.remove(&coord);
         if removed.is_some() {
             self.chunk_changes.unloaded.push(coord);
@@ -392,6 +446,38 @@ mod tests {
         let changes = world.take_chunk_changes();
         assert_eq!(changes.unloaded.len(), 9);
         assert_eq!(changes.loaded.len(), 9);
+    }
+
+    #[test]
+    fn streamed_chunks_are_restored_from_memory_after_unloading() {
+        let mut world = World::new(42);
+        let original_position = Vec3::ZERO;
+        let original_coord = ChunkCoord::default();
+        world.stream_around(original_position, 0);
+        wait_for_loaded_chunks(&mut world, original_position, 0, 1);
+        world.set_voxel([1, 2, 3], 7);
+
+        let moved_position = Vec3::new(CHUNK_EDGE as f32, 0.0, 0.0);
+        world.stream_around(moved_position, 0);
+        wait_for_loaded_chunks(&mut world, moved_position, 0, 1);
+        world.take_chunk_changes();
+        world.take_generation_timings();
+
+        assert!(world.stream_around(original_position, 0));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while world.chunk(original_coord).is_none() && Instant::now() < deadline {
+            world.stream_around(original_position, 0);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            world.chunk(original_coord).unwrap().voxel([1, 2, 3]),
+            Some(7)
+        );
+        assert_eq!(world.pending_chunk_count(), 0);
+        assert_eq!(world.take_generation_timings(), (0, Duration::ZERO));
+        let changes = world.take_chunk_changes();
+        assert_eq!(changes.loaded, vec![original_coord]);
+        assert_eq!(changes.unloaded, vec![ChunkCoord { x: 1, y: 0, z: 0 }]);
     }
 
     #[test]
