@@ -39,14 +39,14 @@ impl WorldInteractor {
             MouseButton::Left => {
                 if state.is_pressed() {
                     self.action = Action::Break;
-                } else {
+                } else if self.action == Action::Break {
                     self.action = Action::None;
                 }
             }
             MouseButton::Right => {
                 if state.is_pressed() {
                     self.action = Action::Place;
-                } else {
+                } else if self.action == Action::Place {
                     self.action = Action::None;
                 }
             }
@@ -91,11 +91,15 @@ impl WorldInteractor {
             }
             Action::Place => {
                 if let Some(hit) = world.raycast(camera.position, camera.forward(), 10.0) {
-                    println!(
-                        "Place voxel at ({}, {}, {})",
-                        hit.voxel[0], hit.voxel[1], hit.voxel[2],
-                    );
-                    world.set_voxel(hit.voxel, self.block_type);
+                    let voxel = [
+                        hit.voxel[0] + hit.normal[0],
+                        hit.voxel[1] + hit.normal[1],
+                        hit.voxel[2] + hit.normal[2],
+                    ];
+                    println!("Place voxel at ({}, {}, {})", voxel[0], voxel[1], voxel[2],);
+                    if world.voxel(voxel) == Some(0) {
+                        world.set_voxel(voxel, self.block_type);
+                    }
                 };
                 self.action = Action::None;
             }
@@ -171,6 +175,10 @@ mod tests {
         interactor.process_mouse_input(MouseButton::Left, ElementState::Pressed);
         interactor.process_mouse_input(MouseButton::Middle, ElementState::Released);
         assert_eq!(interactor.action, Action::Break);
+
+        interactor.process_mouse_input(MouseButton::Right, ElementState::Pressed);
+        interactor.process_mouse_input(MouseButton::Left, ElementState::Released);
+        assert_eq!(interactor.action, Action::Place);
     }
 
     #[test]
@@ -229,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn place_replaces_the_hit_voxel_with_the_selected_block_type() {
+    fn place_adds_the_selected_block_next_to_the_hit_voxel() {
         let mut interactor = WorldInteractor::default();
         let mut world = world_with_target_voxel();
         interactor.process_physical_key(code(KeyCode::Digit2), ElementState::Pressed);
@@ -243,12 +251,41 @@ mod tests {
                 .chunk(ChunkCoord { x: 0, y: 0, z: 0 })
                 .unwrap()
                 .voxel([8, 8, 8]),
+            Some(1)
+        );
+        assert_eq!(
+            world
+                .chunk(ChunkCoord { x: 0, y: 0, z: 0 })
+                .unwrap()
+                .voxel([8, 8, 9]),
             Some(2)
         );
         assert_eq!(
             world.take_chunk_changes().updated,
             vec![ChunkCoord { x: 0, y: 0, z: 0 }]
         );
+    }
+
+    #[test]
+    fn place_does_not_write_into_an_unloaded_adjacent_chunk() {
+        let mut interactor = WorldInteractor::default();
+        let mut world = World::new(42);
+        let mut chunk = Chunk::new();
+        chunk.set_voxel([8, 8, CHUNK_EDGE as i32 - 1], 1);
+        world.insert_chunk(ChunkCoord { x: 0, y: 0, z: 0 }, chunk);
+        world.take_chunk_changes();
+        interactor.process_mouse_input(MouseButton::Right, ElementState::Pressed);
+
+        let camera = Camera {
+            position: Vec3::new(8.5, 8.5, CHUNK_EDGE as f32 + 4.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        interactor.update(&camera, &mut world);
+
+        assert_eq!(world.voxel([8, 8, CHUNK_EDGE as i32 - 1]), Some(1));
+        assert_eq!(world.voxel([8, 8, CHUNK_EDGE as i32]), None);
+        assert!(world.take_chunk_changes().updated.is_empty());
     }
 
     #[test]

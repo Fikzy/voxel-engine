@@ -17,6 +17,7 @@ const MAX_CHUNKS_INTEGRATED_PER_FRAME: usize = 8;
 pub struct WorldRayHit {
     pub chunk: ChunkCoord,
     pub voxel: [i32; 3],
+    pub normal: [i32; 3],
     pub material: u8,
     pub distance: f32,
 }
@@ -282,6 +283,12 @@ impl World {
         self.chunks.get(&coord)
     }
 
+    pub fn voxel(&self, voxel: [i32; 3]) -> Option<u8> {
+        let chunk_coord = ChunkCoord::from_voxel(voxel[0], voxel[1], voxel[2]);
+        let local_voxel = ChunkCoord::local_voxel(voxel[0], voxel[1], voxel[2]);
+        self.chunks.get(&chunk_coord)?.voxel(local_voxel)
+    }
+
     pub fn stream_bounds(&self) -> Option<(ChunkCoord, [u32; 3])> {
         self.stream_origin
             .map(|origin| (origin, self.stream_dimensions))
@@ -320,6 +327,7 @@ impl World {
                         coord.y * CHUNK_EDGE as i32 + hit.voxel[1] as i32,
                         coord.z * CHUNK_EDGE as i32 + hit.voxel[2] as i32,
                     ],
+                    normal: hit.normal,
                     material: hit.material,
                     distance: hit.distance,
                 })
@@ -585,6 +593,7 @@ mod tests {
                 edge + middle as i32
             ]
         );
+        assert_eq!(hit.normal, [-1, 0, 0]);
         assert_eq!(hit.material, 2);
     }
 

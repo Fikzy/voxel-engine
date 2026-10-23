@@ -36,6 +36,7 @@ pub struct Chunk {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayHit {
     pub voxel: [i32; 3],
+    pub normal: [i32; 3],
     pub material: u8,
     pub distance: f32,
 }
@@ -99,6 +100,7 @@ impl Chunk {
         let edge = CHUNK_EDGE as f32;
         let mut entry = 0.0_f32;
         let mut exit = max_distance;
+        let mut entry_axis = None;
 
         for axis in 0..3 {
             let origin_axis = origin[axis];
@@ -112,7 +114,11 @@ impl Chunk {
 
             let first = (0.0 - origin_axis) / direction_axis;
             let second = (edge - origin_axis) / direction_axis;
-            entry = entry.max(first.min(second));
+            let near = first.min(second);
+            if near > entry || (entry_axis.is_none() && near == entry) {
+                entry = near;
+                entry_axis = Some(axis);
+            }
             exit = exit.min(first.max(second));
         }
 
@@ -125,6 +131,10 @@ impl Chunk {
         let mut step = [0_i32; 3];
         let mut next_boundary = [f32::INFINITY; 3];
         let mut delta = [f32::INFINITY; 3];
+        let mut normal = [0_i32; 3];
+        if let Some(axis) = entry_axis {
+            normal[axis] = -(direction[axis].signum() as i32);
+        }
 
         for axis in 0..3 {
             voxel[axis] = start[axis].floor() as i32;
@@ -152,6 +162,7 @@ impl Chunk {
             if material != 0 {
                 return Some(RayHit {
                     voxel,
+                    normal,
                     material,
                     distance,
                 });
@@ -168,6 +179,8 @@ impl Chunk {
             distance = next_boundary[axis];
             voxel[axis] += step[axis];
             next_boundary[axis] += delta[axis];
+            normal = [0; 3];
+            normal[axis] = -step[axis];
         }
         None
     }
@@ -278,6 +291,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(center_hit.voxel, [middle, middle, depth]);
+        assert_eq!(center_hit.normal, [0, 0, 1]);
         assert_eq!(center_hit.material, 1);
 
         let edge_hit = chunk
@@ -288,6 +302,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edge_hit.voxel, [(CHUNK_EDGE - 1) as i32, middle, depth]);
+        assert_eq!(edge_hit.normal, [1, 0, 0]);
         assert_eq!(edge_hit.material, 2);
 
         assert!(
@@ -313,6 +328,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry_hit.voxel, [0, middle, depth]);
+        assert_eq!(entry_hit.normal, [-1, 0, 0]);
         assert_eq!(entry_hit.material, 3);
     }
 
