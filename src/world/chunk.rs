@@ -29,6 +29,7 @@ impl ChunkCoord {
     }
 }
 
+#[derive(Clone)]
 pub struct Chunk {
     voxels: Box<[u8]>,
 }

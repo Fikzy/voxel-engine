@@ -49,6 +49,9 @@ enum ChunkManagerRequest {
         unload: Vec<(ChunkCoord, Chunk)>,
         load: Vec<ChunkCoord>,
     },
+    Accept {
+        coord: ChunkCoord,
+    },
     Discard {
         coord: ChunkCoord,
     },
@@ -85,6 +88,11 @@ impl ChunkManager {
                             unload,
                             load,
                         }) => (epoch, unload, load),
+                        Ok(ChunkManagerRequest::Accept { coord }) => {
+                            cached_chunks.remove(&coord);
+                            request = request_rx.recv();
+                            continue;
+                        }
                         Ok(ChunkManagerRequest::Discard { coord }) => {
                             cached_chunks.remove(&coord);
                             request = request_rx.recv();
@@ -96,8 +104,8 @@ impl ChunkManager {
                     cached_chunks.extend(unload);
                     for coord in load {
                         let (chunk, generation_time) =
-                            if let Some(chunk) = cached_chunks.remove(&coord) {
-                                (chunk, None)
+                            if let Some(chunk) = cached_chunks.get(&coord) {
+                                (chunk.clone(), None)
                             } else {
                                 let start = Instant::now();
                                 let chunk = Chunk::generate(coord, &noise);
@@ -117,6 +125,9 @@ impl ChunkManager {
                         loop {
                             match request_rx.try_recv() {
                                 Ok(ChunkManagerRequest::Shutdown) => break 'worker,
+                                Ok(ChunkManagerRequest::Accept { coord }) => {
+                                    cached_chunks.remove(&coord);
+                                }
                                 Ok(ChunkManagerRequest::Discard { coord }) => {
                                     cached_chunks.remove(&coord);
                                 }
@@ -163,6 +174,10 @@ impl ChunkManager {
 
     fn discard(&self, coord: ChunkCoord) {
         let _ = self.requests.send(ChunkManagerRequest::Discard { coord });
+    }
+
+    fn accept(&self, coord: ChunkCoord) {
+        let _ = self.requests.send(ChunkManagerRequest::Accept { coord });
     }
 }
 
@@ -266,6 +281,7 @@ impl World {
                 let was_missing = !self.chunks.contains_key(&loaded.coord);
                 if was_missing {
                     self.chunks.insert(loaded.coord, loaded.chunk);
+                    self.chunk_manager.accept(loaded.coord);
                     self.chunk_changes.loaded.push(loaded.coord);
                     if let Some(generation_time) = loaded.generation_time {
                         self.generated_chunks_since_report += 1;
@@ -406,7 +422,34 @@ mod tests {
     use glam::Vec3;
     use libnoise::Source;
 
-    use super::{CHUNK_EDGE, Chunk, ChunkCoord, STREAM_RADIUS, World};
+    use super::{CHUNK_EDGE, Chunk, ChunkCoord, ChunkManager, STREAM_RADIUS, World};
+
+    #[test]
+    fn stale_cached_load_keeps_modified_chunk_in_manager_cache() {
+        let manager = ChunkManager::new(42);
+        let coord = ChunkCoord::default();
+        let mut chunk = Chunk::new();
+        chunk.set_voxel([1, 2, 3], 7);
+        manager.update(1, vec![(coord, chunk)], Vec::new());
+        manager.update(2, Vec::new(), vec![coord]);
+
+        let stale_result = manager
+            .results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(stale_result.epoch, 2);
+        assert_eq!(stale_result.chunk.voxel([1, 2, 3]), Some(7));
+        assert_eq!(stale_result.generation_time, None);
+
+        manager.update(3, Vec::new(), vec![coord]);
+        let reloaded = manager
+            .results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(reloaded.epoch, 3);
+        assert_eq!(reloaded.chunk.voxel([1, 2, 3]), Some(7));
+        assert_eq!(reloaded.generation_time, None);
+    }
 
     #[test]
     fn streaming_loads_and_unloads_a_chunk_size_aware_region() {
